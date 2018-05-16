@@ -51,3 +51,4 @@ profile.tmp
 .DS_Store
 
 main*
+rtx_export*

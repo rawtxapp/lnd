@@ -580,6 +580,15 @@ func lndMain() error {
 				break
 			}
 
+			select {
+			case <-shutdownRequestChannel:
+				rpcServer.Stop()
+				fundingMgr.Stop()
+				shutdownSuccessChannel <- true
+
+			default:
+			}
+
 			time.Sleep(time.Second * 1)
 		}
 
@@ -633,6 +642,7 @@ func lndMain() error {
 	// the interrupt handler.
 	<-shutdownChannel
 	ltndLog.Info("Shutdown complete")
+	shutdownSuccessChannel <- true
 	return nil
 }
 
@@ -717,10 +727,9 @@ func genCertPair(certFile, keyFile string) error {
 	}
 
 	// Collect the host's names into a slice.
-	host, err := os.Hostname()
-	if err != nil {
-		return err
-	}
+	// Android doesn't allow accessing /proc/sys
+	// which is used by the os.Hostname call.
+	host := "localhost"
 	dnsNames := []string{host}
 	if host != "localhost" {
 		dnsNames = append(dnsNames, "localhost")
@@ -1014,6 +1023,10 @@ func waitForWalletPassword(
 		return walletInitParams, nil
 
 	case <-shutdownChannel:
+		return nil, fmt.Errorf("shutting down")
+
+	case <-shutdownRequestChannel:
+		shutdownSuccessChannel <- true
 		return nil, fmt.Errorf("shutting down")
 	}
 }
