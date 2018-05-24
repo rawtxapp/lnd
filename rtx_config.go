@@ -16,9 +16,9 @@ import (
 
 var (
 	channelDB              *channeldb.DB
-	shutdownSuccessChannel = make(chan bool)
-	fout                   *os.File
-	ferr                   *os.File
+	shutdownSuccessChannel          = make(chan bool)
+	fout                   *os.File = nil
+	ferr                   *os.File = nil
 )
 
 type Shutdown struct{}
@@ -28,20 +28,24 @@ type Shutdown struct{}
 //export InitLnd
 func InitLnd(lndHomeDir *C.char) *C.char {
 	lndHomeDirString := C.GoString(lndHomeDir)
-	// setStdout(lndHomeDirString)
 	err := initLnd(lndHomeDirString)
 	if err != nil {
-		// shutdownStdout()
+		shutdownStdout()
 		return C.CString(err.Error())
 	}
 	return C.CString("")
+}
+
+//export SetStdout
+func SetStdout(lndHomeDir *C.char) {
+	setStdout(C.GoString(lndHomeDir))
 }
 
 //export StopLnd
 func StopLnd() bool {
 	shutdownRequestChannel <- struct{}{}
 	success := <-shutdownSuccessChannel
-	// shutdownStdout()
+	shutdownStdout()
 	return success
 }
 
@@ -75,8 +79,12 @@ func setStdout(lndHomeDir string) {
 }
 
 func shutdownStdout() {
-	fout.Close()
-	ferr.Close()
+	if fout != nil {
+		fout.Close()
+	}
+	if ferr != nil {
+		ferr.Close()
+	}
 }
 
 func initLnd(lndHomeDir string) error {
