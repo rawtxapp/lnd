@@ -593,15 +593,6 @@ func lndMain() error {
 				break
 			}
 
-			select {
-			case <-shutdownRequestChannel:
-				rpcServer.Stop()
-				fundingMgr.Stop()
-				shutdownSuccessChannel <- true
-
-			default:
-			}
-
 			time.Sleep(time.Second * 1)
 		}
 
