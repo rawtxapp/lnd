@@ -139,9 +139,14 @@ type Config struct {
 // will be rejected by this struct.
 type AuthenticatedGossiper struct {
 	// Parameters which are needed to properly handle the start and stop of
-	// the service.
+	// the service. To be used atomically.
 	started uint32
 	stopped uint32
+
+	// bestHeight is the height of the block at the tip of the main chain
+	// as we know it. To be used atomically.
+	bestHeight uint32
+
 	quit    chan struct{}
 	wg      sync.WaitGroup
 
@@ -185,10 +190,6 @@ type AuthenticatedGossiper struct {
 	// chanPolicyUpdates is a channel that requests to update the
 	// forwarding policy of a set of channels is sent over.
 	chanPolicyUpdates chan *chanPolicyUpdateRequest
-
-	// bestHeight is the height of the block at the tip of the main chain
-	// as we know it.
-	bestHeight uint32
 
 	// selfKey is the identity public key of the backing Lightning node.
 	selfKey *btcec.PublicKey
@@ -525,7 +526,7 @@ type msgWithSenders struct {
 // with peers that we have an active gossipSyncer with. We do this to ensure
 // that we don't broadcast messages to any peers that we have active gossip
 // syncers for.
-func (m *msgWithSenders) mergeSyncerMap(syncers map[routing.Vertex]struct{}) {
+func (m *msgWithSenders) mergeSyncerMap(syncers map[routing.Vertex]*gossipSyncer) {
 	for peerPub := range syncers {
 		m.senders[peerPub] = struct{}{}
 	}
@@ -1130,9 +1131,9 @@ func (d *AuthenticatedGossiper) networkHandler() {
 			// syncers, we'll collect their pubkeys so we can avoid
 			// sending them the full message blast below.
 			d.syncerMtx.RLock()
-			syncerPeers := map[routing.Vertex]struct{}{}
-			for peerPub := range d.peerSyncers {
-				syncerPeers[peerPub] = struct{}{}
+			syncerPeers := make(map[routing.Vertex]*gossipSyncer)
+			for peerPub, syncer := range d.peerSyncers {
+				syncerPeers[peerPub] = syncer
 			}
 			d.syncerMtx.RUnlock()
 
@@ -1142,11 +1143,9 @@ func (d *AuthenticatedGossiper) networkHandler() {
 			// We'll first attempt to filter out this new message
 			// for all peers that have active gossip syncers
 			// active.
-			d.syncerMtx.RLock()
-			for _, syncer := range d.peerSyncers {
+			for _, syncer := range syncerPeers {
 				syncer.FilterGossipMsgs(announcementBatch...)
 			}
-			d.syncerMtx.RUnlock()
 
 			// Next, If we have new things to announce then
 			// broadcast them to all our immediately connected
@@ -1234,8 +1233,7 @@ func (d *AuthenticatedGossiper) PruneSyncState(peer *btcec.PublicKey) {
 		peer.SerializeCompressed())
 
 	vertex := routing.NewVertex(peer)
-
-	syncer, ok := d.peerSyncers[routing.NewVertex(peer)]
+	syncer, ok := d.peerSyncers[vertex]
 	if !ok {
 		return
 	}
