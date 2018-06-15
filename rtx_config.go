@@ -16,7 +16,7 @@ import (
 
 var (
 	channelDB              *channeldb.DB
-	shutdownSuccessChannel          = make(chan bool)
+	shutdownSuccessChannel          = make(chan bool, 1)
 	fout                   *os.File = nil
 	ferr                   *os.File = nil
 )
