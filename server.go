@@ -42,7 +42,7 @@ import (
 const (
 	// defaultMinPeers is the minimum number of peers nodes should always be
 	// connected to.
-	defaultMinPeers = 3
+	defaultMinPeers = 20
 
 	// defaultBackoff is the starting point for exponential backoff for
 	// reconnecting to persistent peers.
@@ -1051,7 +1051,7 @@ func (s *server) peerBootstrapper(numTargetPeers uint32,
 	//
 	// We'll use a 15 second backoff, and double the time every time an
 	// epoch fails up to a ceiling.
-	const backOffCeiling = time.Minute * 5
+	const backOffCeiling = time.Minute * 1
 	backOff := time.Second * 15
 
 	// We'll create a new ticker to wake us up every 15 seconds so we can
