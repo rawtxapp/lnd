@@ -8,8 +8,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec"
 	"github.com/coreos/bbolt"
 	"github.com/davecgh/go-spew/spew"
+
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
@@ -17,9 +21,17 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/lightningnetwork/lnd/ticker"
+)
+
+const (
+	// DefaultFwdEventInterval is the duration between attempts to flush
+	// pending forwarding events to disk.
+	DefaultFwdEventInterval = 15 * time.Second
+
+	// DefaultLogInterval is the duration between attempts to log statistics
+	// about forwarding events.
+	DefaultLogInterval = 10 * time.Second
 )
 
 var (
@@ -145,6 +157,14 @@ type Config struct {
 	// Notifier is an instance of a chain notifier that we'll use to signal
 	// the switch when a new block has arrived.
 	Notifier chainntnfs.ChainNotifier
+
+	// FwdEventTicker is a signal that instructs the htlcswitch to flush any
+	// pending forwarding events.
+	FwdEventTicker ticker.Ticker
+
+	// LogEventTicker is a signal instructing the htlcswitch to log
+	// aggregate stats about it's forwarding during the last interval.
+	LogEventTicker ticker.Ticker
 }
 
 // Switch is the central messaging bus for all incoming/outgoing HTLCs.
@@ -964,9 +984,11 @@ func (s *Switch) handlePacketForward(packet *htlcPacket) error {
 			// Before we check the link's bandwidth, we'll ensure
 			// that the HTLC satisfies the current forwarding
 			// policy of this target link.
+			currentHeight := atomic.LoadUint32(&s.bestHeight)
 			err := link.HtlcSatifiesPolicy(
 				htlc.PaymentHash, packet.incomingAmount,
-				packet.amount,
+				packet.amount, packet.incomingTimeout,
+				packet.outgoingTimeout, currentHeight,
 			)
 			if err != nil {
 				linkErrs[link.ShortChanID()] = err
@@ -1249,7 +1271,7 @@ func (s *Switch) closeCircuit(pkt *htlcPacket) (*PaymentCircuit, error) {
 // we're the originator of the payment, so the link stops attempting to
 // re-broadcast.
 func (s *Switch) ackSettleFail(settleFailRef channeldb.SettleFailRef) error {
-	return s.cfg.DB.Update(func(tx *bolt.Tx) error {
+	return s.cfg.DB.Batch(func(tx *bolt.Tx) error {
 		return s.cfg.SwitchPackager.AckSettleFails(tx, settleFailRef)
 	})
 }
@@ -1387,13 +1409,13 @@ func (s *Switch) htlcForwarder() {
 		totalSatSent    btcutil.Amount
 		totalSatRecv    btcutil.Amount
 	)
-	logTicker := time.NewTicker(10 * time.Second)
-	defer logTicker.Stop()
+	s.cfg.LogEventTicker.Resume()
+	defer s.cfg.LogEventTicker.Stop()
 
 	// Every 15 seconds, we'll flush out the forwarding events that
 	// occurred during that period.
-	fwdEventTicker := time.NewTicker(15 * time.Second)
-	defer fwdEventTicker.Stop()
+	s.cfg.FwdEventTicker.Resume()
+	defer s.cfg.FwdEventTicker.Stop()
 
 out:
 	for {
@@ -1404,6 +1426,7 @@ out:
 			}
 
 			atomic.StoreUint32(&s.bestHeight, uint32(blockEpoch.Height))
+
 		// A local close request has arrived, we'll forward this to the
 		// relevant link (if it exists) so the channel can be
 		// cooperatively closed (if possible).
@@ -1470,7 +1493,7 @@ out:
 		// When this time ticks, then it indicates that we should
 		// collect all the forwarding events since the last internal,
 		// and write them out to our log.
-		case <-fwdEventTicker.C:
+		case <-s.cfg.FwdEventTicker.Ticks():
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
@@ -1484,7 +1507,7 @@ out:
 		// The log ticker has fired, so we'll calculate some forwarding
 		// stats for the last 10 seconds to display within the logs to
 		// users.
-		case <-logTicker.C:
+		case <-s.cfg.LogEventTicker.Ticks():
 			// First, we'll collate the current running tally of
 			// our forwarding stats.
 			prevSatSent := totalSatSent
@@ -1883,7 +1906,7 @@ func (s *Switch) removeLink(chanID lnwire.ChannelID) error {
 		}
 	}
 
-	link.Stop()
+	go link.Stop()
 
 	return nil
 }

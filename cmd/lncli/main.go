@@ -14,9 +14,10 @@ import (
 
 	macaroon "gopkg.in/macaroon.v2"
 
+	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/macaroons"
-	"github.com/roasbeef/btcutil"
 	"github.com/urfave/cli"
 
 	"google.golang.org/grpc"
@@ -26,6 +27,8 @@ import (
 const (
 	defaultTLSCertFilename  = "tls.cert"
 	defaultMacaroonFilename = "admin.macaroon"
+	defaultRPCPort          = "10009"
+	defaultRPCHostPort      = "localhost:" + defaultRPCPort
 )
 
 var (
@@ -143,6 +146,13 @@ func getClientConn(ctx *cli.Context, skipMacaroons bool) *grpc.ClientConn {
 		opts = append(opts, grpc.WithPerRPCCredentials(cred))
 	}
 
+	// We need to use a custom dialer so we can also connect to unix sockets
+	// and not just TCP addresses.
+	opts = append(
+		opts, grpc.WithDialer(
+			lncfg.ClientAddressDialer(defaultRPCPort),
+		),
+	)
 	conn, err := grpc.Dial(ctx.GlobalString("rpcserver"), opts...)
 	if err != nil {
 		fatal(err)
@@ -159,7 +169,7 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "rpcserver",
-			Value: "localhost:10009",
+			Value: defaultRPCHostPort,
 			Usage: "host:port of ln daemon",
 		},
 		cli.StringFlag{

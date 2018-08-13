@@ -14,6 +14,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/fastsha256"
 	"github.com/coreos/bbolt"
 	"github.com/go-errors/errors"
@@ -24,10 +28,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/shachain"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
+	"github.com/lightningnetwork/lnd/ticker"
 )
 
 var (
@@ -271,14 +272,11 @@ func createTestChannel(alicePrivKey, bobPrivKey []byte,
 		return nil, nil, nil, nil, err
 	}
 
-	estimator := &lnwallet.StaticFeeEstimator{
-		FeeRate: 24,
-	}
-	feePerVSize, err := estimator.EstimateFeePerVSize(1)
+	estimator := &lnwallet.StaticFeeEstimator{FeePerKW: 6000}
+	feePerKw, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	feePerKw := feePerVSize.FeePerKWeight()
 	commitFee := feePerKw.FeeForWeight(724)
 
 	const broadcastHeight = 1
@@ -601,15 +599,17 @@ func generateHops(payAmt lnwire.MilliSatoshi, startingHeight uint32,
 			nextHop = path[i+1].channel.ShortChanID()
 		}
 
+		var timeLock uint32
 		// If this is the last, hop, then the time lock will be their
 		// specified delta policy plus our starting height.
-		totalTimelock += lastHop.cfg.FwrdingPolicy.TimeLockDelta
-		timeLock := totalTimelock
-
-		// Otherwise, the outgoing time lock should be the incoming
-		// timelock minus their specified delta.
-		if i != len(path)-1 {
-			delta := path[i].cfg.FwrdingPolicy.TimeLockDelta
+		if i == len(path)-1 {
+			totalTimelock += lastHop.cfg.FwrdingPolicy.TimeLockDelta
+			timeLock = totalTimelock
+		} else {
+			// Otherwise, the outgoing time lock should be the
+			// incoming timelock minus their specified delta.
+			delta := path[i+1].cfg.FwrdingPolicy.TimeLockDelta
+			totalTimelock += delta
 			timeLock = totalTimelock - delta
 		}
 
@@ -842,16 +842,24 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	bobDb := firstBobChannel.State().Db
 	carolDb := carolChannel.State().Db
 
+	defaultDelta := uint32(6)
+
 	// Create three peers/servers.
-	aliceServer, err := newMockServer(t, "alice", startingHeight, aliceDb)
+	aliceServer, err := newMockServer(
+		t, "alice", startingHeight, aliceDb, defaultDelta,
+	)
 	if err != nil {
 		t.Fatalf("unable to create alice server: %v", err)
 	}
-	bobServer, err := newMockServer(t, "bob", startingHeight, bobDb)
+	bobServer, err := newMockServer(
+		t, "bob", startingHeight, bobDb, defaultDelta,
+	)
 	if err != nil {
 		t.Fatalf("unable to create bob server: %v", err)
 	}
-	carolServer, err := newMockServer(t, "carol", startingHeight, carolDb)
+	carolServer, err := newMockServer(
+		t, "carol", startingHeight, carolDb, defaultDelta,
+	)
 	if err != nil {
 		t.Fatalf("unable to create carol server: %v", err)
 	}
@@ -863,14 +871,15 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	carolDecoder := newMockIteratorDecoder()
 
 	feeEstimator := &mockFeeEstimator{
-		byteFeeIn: make(chan lnwallet.SatPerVByte),
+		byteFeeIn: make(chan lnwallet.SatPerKWeight),
 		quit:      make(chan struct{}),
 	}
 
 	const (
-		batchTimeout     = 50 * time.Millisecond
-		fwdPkgTimeout    = 5 * time.Second
-		feeUpdateTimeout = 30 * time.Minute
+		batchTimeout        = 50 * time.Millisecond
+		fwdPkgTimeout       = 5 * time.Second
+		minFeeUpdateTimeout = 30 * time.Minute
+		maxFeeUpdateTimeout = 40 * time.Minute
 	)
 
 	pCache := &mockPreimageCache{
@@ -881,7 +890,7 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 	globalPolicy := ForwardingPolicy{
 		MinHTLC:       lnwire.NewMSatFromSatoshis(5),
 		BaseFee:       lnwire.NewMSatFromSatoshis(1),
-		TimeLockDelta: 6,
+		TimeLockDelta: defaultDelta,
 	}
 	obfuscator := NewMockObfuscator()
 
@@ -907,10 +916,10 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 			ChainEvents:         &contractcourt.ChainEventSubscription{},
 			SyncStates:          true,
 			BatchSize:           10,
-			BatchTicker:         &mockTicker{time.NewTicker(batchTimeout).C},
-			FwdPkgGCTicker:      &mockTicker{time.NewTicker(fwdPkgTimeout).C},
-			MinFeeUpdateTimeout: feeUpdateTimeout,
-			MaxFeeUpdateTimeout: feeUpdateTimeout,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
 			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		aliceChannel,
@@ -950,10 +959,10 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 			ChainEvents:         &contractcourt.ChainEventSubscription{},
 			SyncStates:          true,
 			BatchSize:           10,
-			BatchTicker:         &mockTicker{time.NewTicker(batchTimeout).C},
-			FwdPkgGCTicker:      &mockTicker{time.NewTicker(fwdPkgTimeout).C},
-			MinFeeUpdateTimeout: feeUpdateTimeout,
-			MaxFeeUpdateTimeout: feeUpdateTimeout,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
 			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		firstBobChannel,
@@ -993,10 +1002,10 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 			ChainEvents:         &contractcourt.ChainEventSubscription{},
 			SyncStates:          true,
 			BatchSize:           10,
-			BatchTicker:         &mockTicker{time.NewTicker(batchTimeout).C},
-			FwdPkgGCTicker:      &mockTicker{time.NewTicker(fwdPkgTimeout).C},
-			MinFeeUpdateTimeout: feeUpdateTimeout,
-			MaxFeeUpdateTimeout: feeUpdateTimeout,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
 			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		secondBobChannel,
@@ -1036,10 +1045,10 @@ func newThreeHopNetwork(t testing.TB, aliceChannel, firstBobChannel,
 			ChainEvents:         &contractcourt.ChainEventSubscription{},
 			SyncStates:          true,
 			BatchSize:           10,
-			BatchTicker:         &mockTicker{time.NewTicker(batchTimeout).C},
-			FwdPkgGCTicker:      &mockTicker{time.NewTicker(fwdPkgTimeout).C},
-			MinFeeUpdateTimeout: feeUpdateTimeout,
-			MaxFeeUpdateTimeout: feeUpdateTimeout,
+			BatchTicker:         ticker.MockNew(batchTimeout),
+			FwdPkgGCTicker:      ticker.MockNew(fwdPkgTimeout),
+			MinFeeUpdateTimeout: minFeeUpdateTimeout,
+			MaxFeeUpdateTimeout: maxFeeUpdateTimeout,
 			OnChannelFailure:    func(lnwire.ChannelID, lnwire.ShortChannelID, LinkFailureError) {},
 		},
 		carolChannel,

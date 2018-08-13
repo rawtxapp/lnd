@@ -19,13 +19,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcutil"
 	flags "github.com/jessevdk/go-flags"
-	"github.com/lightningnetwork/lnd/brontide"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/tor"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil"
 )
 
 const (
@@ -132,11 +131,12 @@ type btcdConfig struct {
 }
 
 type bitcoindConfig struct {
-	Dir     string `long:"dir" description:"The base directory that contains the node's data, logs, configuration file, etc."`
-	RPCHost string `long:"rpchost" description:"The daemon's rpc listening address. If a port is omitted, then the default port for the selected chain parameters will be used."`
-	RPCUser string `long:"rpcuser" description:"Username for RPC connections"`
-	RPCPass string `long:"rpcpass" default-mask:"-" description:"Password for RPC connections"`
-	ZMQPath string `long:"zmqpath" description:"The path to the ZMQ socket providing at least raw blocks. Raw transactions can be handled as well."`
+	Dir            string `long:"dir" description:"The base directory that contains the node's data, logs, configuration file, etc."`
+	RPCHost        string `long:"rpchost" description:"The daemon's rpc listening address. If a port is omitted, then the default port for the selected chain parameters will be used."`
+	RPCUser        string `long:"rpcuser" description:"Username for RPC connections"`
+	RPCPass        string `long:"rpcpass" default-mask:"-" description:"Password for RPC connections"`
+	ZMQPubRawBlock string `long:"zmqpubrawblock" description:"The address listening for ZMQ connections to deliver raw block notifications"`
+	ZMQPubRawTx    string `long:"zmqpubrawtx" description:"The address listening for ZMQ connections to deliver raw transaction notifications"`
 }
 
 type autoPilotConfig struct {
@@ -165,26 +165,35 @@ type torConfig struct {
 type config struct {
 	ShowVersion bool `short:"V" long:"version" description:"Display version information and exit"`
 
-	LndDir         string   `long:"lnddir" description:"The base directory that contains lnd's data, logs, configuration file, etc."`
-	ConfigFile     string   `long:"C" long:"configfile" description:"Path to configuration file"`
-	DataDir        string   `short:"b" long:"datadir" description:"The directory to store lnd's data within"`
-	TLSCertPath    string   `long:"tlscertpath" description:"Path to write the TLS certificate for lnd's RPC and REST services"`
-	TLSKeyPath     string   `long:"tlskeypath" description:"Path to write the TLS private key for lnd's RPC and REST services"`
-	TLSExtraIP     string   `long:"tlsextraip" description:"Adds an extra ip to the generated certificate"`
-	TLSExtraDomain string   `long:"tlsextradomain" description:"Adds an extra domain to the generated certificate"`
-	NoMacaroons    bool     `long:"no-macaroons" description:"Disable macaroon authentication"`
-	AdminMacPath   string   `long:"adminmacaroonpath" description:"Path to write the admin macaroon for lnd's RPC and REST services if it doesn't exist"`
-	ReadMacPath    string   `long:"readonlymacaroonpath" description:"Path to write the read-only macaroon for lnd's RPC and REST services if it doesn't exist"`
-	InvoiceMacPath string   `long:"invoicemacaroonpath" description:"Path to the invoice-only macaroon for lnd's RPC and REST services if it doesn't exist"`
-	LogDir         string   `long:"logdir" description:"Directory to log output."`
-	MaxLogFiles    int      `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
-	MaxLogFileSize int      `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
-	RPCListeners   []string `long:"rpclisten" description:"Add an interface/port to listen for RPC connections"`
-	RESTListeners  []string `long:"restlisten" description:"Add an interface/port to listen for REST connections"`
-	Listeners      []string `long:"listen" description:"Add an interface/port to listen for peer connections"`
-	DisableListen  bool     `long:"nolisten" description:"Disable listening for incoming peer connections"`
-	ExternalIPs    []string `long:"externalip" description:"Add an ip:port to the list of local addresses we claim to listen on to peers. If a port is not specified, the default (9735) will be used regardless of other parameters"`
-	NAT            bool     `long:"nat" description:"Toggle NAT traversal support (using either UPnP or NAT-PMP) to automatically advertise your external IP address to the network -- NOTE this does not support devices behind multiple NATs"`
+	LndDir         string `long:"lnddir" description:"The base directory that contains lnd's data, logs, configuration file, etc."`
+	ConfigFile     string `long:"C" long:"configfile" description:"Path to configuration file"`
+	DataDir        string `short:"b" long:"datadir" description:"The directory to store lnd's data within"`
+	TLSCertPath    string `long:"tlscertpath" description:"Path to write the TLS certificate for lnd's RPC and REST services"`
+	TLSKeyPath     string `long:"tlskeypath" description:"Path to write the TLS private key for lnd's RPC and REST services"`
+	TLSExtraIP     string `long:"tlsextraip" description:"Adds an extra ip to the generated certificate"`
+	TLSExtraDomain string `long:"tlsextradomain" description:"Adds an extra domain to the generated certificate"`
+	NoMacaroons    bool   `long:"no-macaroons" description:"Disable macaroon authentication"`
+	AdminMacPath   string `long:"adminmacaroonpath" description:"Path to write the admin macaroon for lnd's RPC and REST services if it doesn't exist"`
+	ReadMacPath    string `long:"readonlymacaroonpath" description:"Path to write the read-only macaroon for lnd's RPC and REST services if it doesn't exist"`
+	InvoiceMacPath string `long:"invoicemacaroonpath" description:"Path to the invoice-only macaroon for lnd's RPC and REST services if it doesn't exist"`
+	LogDir         string `long:"logdir" description:"Directory to log output."`
+	MaxLogFiles    int    `long:"maxlogfiles" description:"Maximum logfiles to keep (0 for no rotation)"`
+	MaxLogFileSize int    `long:"maxlogfilesize" description:"Maximum logfile size in MB"`
+
+	// We'll parse these 'raw' string arguments into real net.Addrs in the
+	// loadConfig function. We need to expose the 'raw' strings so the
+	// command line library can access them.
+	// Only the parsed net.Addrs should be used!
+	RawRPCListeners  []string `long:"rpclisten" description:"Add an interface/port/socket to listen for RPC connections"`
+	RawRESTListeners []string `long:"restlisten" description:"Add an interface/port/socket to listen for REST connections"`
+	RawListeners     []string `long:"listen" description:"Add an interface/port to listen for peer connections"`
+	RawExternalIPs   []string `long:"externalip" description:"Add an ip:port to the list of local addresses we claim to listen on to peers. If a port is not specified, the default (9735) will be used regardless of other parameters"`
+	RPCListeners     []net.Addr
+	RESTListeners    []net.Addr
+	Listeners        []net.Addr
+	ExternalIPs      []net.Addr
+	DisableListen    bool `long:"nolisten" description:"Disable listening for incoming peer connections"`
+	NAT              bool `long:"nat" description:"Toggle NAT traversal support (using either UPnP or NAT-PMP) to automatically advertise your external IP address to the network -- NOTE this does not support devices behind multiple NATs"`
 
 	DebugLevel string `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
 
@@ -321,16 +330,23 @@ func loadConfig() (*config, error) {
 	// If the provided lnd directory is not the default, we'll modify the
 	// path to all of the files and directories that will live within it.
 	lndDir := cleanAndExpandPath(preCfg.LndDir)
+	configFilePath := cleanAndExpandPath(preCfg.ConfigFile)
 	if lndDir != defaultLndDir {
-		defaultCfg.ConfigFile = filepath.Join(lndDir, defaultConfigFilename)
-		defaultCfg.DataDir = filepath.Join(lndDir, defaultDataDirname)
-		defaultCfg.TLSCertPath = filepath.Join(lndDir, defaultTLSCertFilename)
-		defaultCfg.TLSKeyPath = filepath.Join(lndDir, defaultTLSKeyFilename)
-		defaultCfg.AdminMacPath = filepath.Join(lndDir, defaultAdminMacFilename)
-		defaultCfg.InvoiceMacPath = filepath.Join(lndDir, defaultInvoiceMacFilename)
-		defaultCfg.ReadMacPath = filepath.Join(lndDir, defaultReadMacFilename)
-		defaultCfg.LogDir = filepath.Join(lndDir, defaultLogDirname)
-		defaultCfg.Tor.V2PrivateKeyPath = filepath.Join(lndDir, defaultTorV2PrivateKeyFilename)
+		// If the config file path has not been modified by the user,
+		// then we'll use the default config file path. However, if the
+		// user has modified their lnddir, then we should assume they
+		// intend to use the config file within it.
+		if configFilePath == defaultConfigFile {
+			preCfg.ConfigFile = filepath.Join(lndDir, defaultConfigFilename)
+		}
+		preCfg.DataDir = filepath.Join(lndDir, defaultDataDirname)
+		preCfg.TLSCertPath = filepath.Join(lndDir, defaultTLSCertFilename)
+		preCfg.TLSKeyPath = filepath.Join(lndDir, defaultTLSKeyFilename)
+		preCfg.AdminMacPath = filepath.Join(lndDir, defaultAdminMacFilename)
+		preCfg.InvoiceMacPath = filepath.Join(lndDir, defaultInvoiceMacFilename)
+		preCfg.ReadMacPath = filepath.Join(lndDir, defaultReadMacFilename)
+		preCfg.LogDir = filepath.Join(lndDir, defaultLogDirname)
+		preCfg.Tor.V2PrivateKeyPath = filepath.Join(lndDir, defaultTorV2PrivateKeyFilename)
 	}
 
 	// Create the lnd directory if it doesn't already exist.
@@ -354,9 +370,8 @@ func loadConfig() (*config, error) {
 
 	// Next, load any additional configuration options from the file.
 	var configFileError error
-	cfg := defaultCfg
-	configFile := cleanAndExpandPath(preCfg.ConfigFile)
-	if err := flags.IniParse(configFile, &cfg); err != nil {
+	cfg := preCfg
+	if err := flags.IniParse(cfg.ConfigFile, &cfg); err != nil {
 		configFileError = err
 	}
 
@@ -419,15 +434,37 @@ func loadConfig() (*config, error) {
 	}
 
 	// Validate the Tor config parameters.
-	cfg.Tor.SOCKS = normalizeAddress(
+	socks, err := lncfg.ParseAddressString(
 		cfg.Tor.SOCKS, strconv.Itoa(defaultTorSOCKSPort),
+		cfg.net.ResolveTCPAddr,
 	)
-	cfg.Tor.DNS = normalizeAddress(
-		cfg.Tor.DNS, strconv.Itoa(defaultTorDNSPort),
-	)
-	cfg.Tor.Control = normalizeAddress(
+	if err != nil {
+		return nil, err
+	}
+	cfg.Tor.SOCKS = socks.String()
+
+	// We'll only attempt to normalize and resolve the DNS host if it hasn't
+	// changed, as it doesn't need to be done for the default.
+	if cfg.Tor.DNS != defaultTorDNS {
+		dns, err := lncfg.ParseAddressString(
+			cfg.Tor.DNS, strconv.Itoa(defaultTorDNSPort),
+			cfg.net.ResolveTCPAddr,
+		)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Tor.DNS = dns.String()
+	}
+
+	control, err := lncfg.ParseAddressString(
 		cfg.Tor.Control, strconv.Itoa(defaultTorControlPort),
+		cfg.net.ResolveTCPAddr,
 	)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Tor.Control = control.String()
+
 	switch {
 	case cfg.Tor.V2 && cfg.Tor.V3:
 		return nil, errors.New("either tor.v2 or tor.v3 can be set, " +
@@ -520,6 +557,13 @@ func loadConfig() (*config, error) {
 			return nil, err
 		}
 
+		if cfg.Litecoin.MainNet && cfg.DebugHTLC {
+			str := "%s: debug-htlc mode cannot be used " +
+				"on litecoin mainnet"
+			err := fmt.Errorf(str, funcName)
+			return nil, err
+		}
+
 		// The litecoin chain is the current active chain. However
 		// throughout the codebase we required chaincfg.Params. So as a
 		// temporary hack, we'll mutate the default net params for
@@ -602,7 +646,14 @@ func loadConfig() (*config, error) {
 			return nil, err
 		}
 
-		/*if cfg.Bitcoin.Node == "neutrino" && cfg.Bitcoin.MainNet {
+		if cfg.Bitcoin.MainNet && cfg.DebugHTLC {
+			str := "%s: debug-htlc mode cannot be used " +
+				"on bitcoin mainnet"
+			err := fmt.Errorf(str, funcName)
+			return nil, err
+		}
+
+		if cfg.Bitcoin.Node == "neutrino" && cfg.Bitcoin.MainNet {
 			str := "%s: neutrino isn't yet supported for " +
 				"bitcoin's mainnet"
 			err := fmt.Errorf(str, funcName)
@@ -735,8 +786,8 @@ func loadConfig() (*config, error) {
 
 	// Initialize logging at the default logging level.
 	initLogRotator(
-		filepath.Join(cfg.LogDir, defaultLogFilename), cfg.MaxLogFileSize,
-		cfg.MaxLogFiles,
+		filepath.Join(cfg.LogDir, defaultLogFilename),
+		cfg.MaxLogFileSize, cfg.MaxLogFiles,
 	)
 
 	// Parse, validate, and set debug log level(s).
@@ -747,33 +798,59 @@ func loadConfig() (*config, error) {
 		return nil, err
 	}
 
-	// At least one RPCListener is required.
-	if len(cfg.RPCListeners) == 0 {
+	// At least one RPCListener is required. So listen on localhost per
+	// default.
+	if len(cfg.RawRPCListeners) == 0 {
 		addr := fmt.Sprintf("localhost:%d", defaultRPCPort)
-		cfg.RPCListeners = append(cfg.RPCListeners, addr)
+		cfg.RawRPCListeners = append(cfg.RawRPCListeners, addr)
 	}
 
-	// Listen on the default interface/port if no REST listeners were
-	// specified.
-	if len(cfg.RESTListeners) == 0 {
+	// Listen on localhost if no REST listeners were specified.
+	if len(cfg.RawRESTListeners) == 0 {
 		addr := fmt.Sprintf("localhost:%d", defaultRESTPort)
-		cfg.RESTListeners = append(cfg.RESTListeners, addr)
+		cfg.RawRESTListeners = append(cfg.RawRESTListeners, addr)
 	}
 
 	// Listen on the default interface/port if no listeners were specified.
-	if len(cfg.Listeners) == 0 {
+	// An empty address string means default interface/address, which on
+	// most unix systems is the same as 0.0.0.0.
+	if len(cfg.RawListeners) == 0 {
 		addr := fmt.Sprintf(":%d", defaultPeerPort)
-		cfg.Listeners = append(cfg.Listeners, addr)
+		cfg.RawListeners = append(cfg.RawListeners, addr)
 	}
 
 	// For each of the RPC listeners (REST+gRPC), we'll ensure that users
 	// have specified a safe combo for authentication. If not, we'll bail
 	// out with an error.
-	err := enforceSafeAuthentication(cfg.RPCListeners, !cfg.NoMacaroons)
+	err = lncfg.EnforceSafeAuthentication(
+		cfg.RPCListeners, !cfg.NoMacaroons,
+	)
 	if err != nil {
 		return nil, err
 	}
-	err = enforceSafeAuthentication(cfg.RESTListeners, !cfg.NoMacaroons)
+	err = lncfg.EnforceSafeAuthentication(
+		cfg.RESTListeners, !cfg.NoMacaroons,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add default port to all RPC listener addresses if needed and remove
+	// duplicate addresses.
+	cfg.RPCListeners, err = lncfg.NormalizeAddresses(
+		cfg.RawRPCListeners, strconv.Itoa(defaultRPCPort),
+		cfg.net.ResolveTCPAddr,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add default port to all REST listener addresses if needed and remove
+	// duplicate addresses.
+	cfg.RESTListeners, err = lncfg.NormalizeAddresses(
+		cfg.RawRESTListeners, strconv.Itoa(defaultRESTPort),
+		cfg.net.ResolveTCPAddr,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -783,40 +860,46 @@ func loadConfig() (*config, error) {
 		ltndLog.Infof("Listening on the p2p interface is disabled!")
 		cfg.Listeners = nil
 		cfg.ExternalIPs = nil
+	} else {
+
+		// Add default port to all listener addresses if needed and remove
+		// duplicate addresses.
+		cfg.Listeners, err = lncfg.NormalizeAddresses(
+			cfg.RawListeners, strconv.Itoa(defaultPeerPort),
+			cfg.net.ResolveTCPAddr,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// Add default port to all external IP addresses if needed and remove
+		// duplicate addresses.
+		cfg.ExternalIPs, err = lncfg.NormalizeAddresses(
+			cfg.RawExternalIPs, strconv.Itoa(defaultPeerPort),
+			cfg.net.ResolveTCPAddr,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// For the p2p port it makes no sense to listen to an Unix socket.
+		// Also, we would need to refactor the brontide listener to support
+		// that.
+		for _, p2pListener := range cfg.Listeners {
+			if lncfg.IsUnix(p2pListener) {
+				err := fmt.Errorf("unix socket addresses cannot be "+
+					"used for the p2p connection listener: %s",
+					p2pListener)
+				return nil, err
+			}
+		}
 	}
-
-	// Add default port to all RPC listener addresses if needed and remove
-	// duplicate addresses.
-	cfg.RPCListeners = normalizeAddresses(
-		cfg.RPCListeners, strconv.Itoa(defaultRPCPort),
-	)
-
-	// Add default port to all REST listener addresses if needed and remove
-	// duplicate addresses.
-	cfg.RESTListeners = normalizeAddresses(
-		cfg.RESTListeners, strconv.Itoa(defaultRESTPort),
-	)
-
-	// Add default port to all listener addresses if needed and remove
-	// duplicate addresses.
-	cfg.Listeners = normalizeAddresses(
-		cfg.Listeners, strconv.Itoa(defaultPeerPort),
-	)
-
-	// Add default port to all external IP addresses if needed and remove
-	// duplicate addresses.
-	cfg.ExternalIPs = normalizeAddresses(
-		cfg.ExternalIPs, strconv.Itoa(defaultPeerPort),
-	)
 
 	// Finally, ensure that we are only listening on localhost if Tor
 	// inbound support is enabled.
 	if cfg.Tor.V2 || cfg.Tor.V3 {
 		for _, addr := range cfg.Listeners {
-			// Due to the addresses being normalized above, we can
-			// skip checking the error.
-			host, _, _ := net.SplitHostPort(addr)
-			if host == "localhost" || host == "127.0.0.1" {
+			if lncfg.IsLoopback(addr.String()) {
 				continue
 			}
 
@@ -945,15 +1028,6 @@ func supportedSubsystems() []string {
 	return subsystems
 }
 
-// noiseDial is a factory function which creates a connmgr compliant dialing
-// function by returning a closure which includes the server's identity key.
-func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
-	return func(a net.Addr) (net.Conn, error) {
-		lnAddr := a.(*lnwire.NetAddress)
-		return brontide.Dial(idPriv, lnAddr, cfg.net.Dial)
-	}
-}
-
 func parseRPCParams(cConfig *chainConfig, nodeConfig interface{}, net chainCode,
 	funcName string) error {
 
@@ -973,8 +1047,12 @@ func parseRPCParams(cConfig *chainConfig, nodeConfig interface{}, net chainCode,
 		switch net {
 		case bitcoinChain:
 			daemonName = "btcd"
+			confDir = conf.Dir
+			confFile = "btcd"
 		case litecoinChain:
 			daemonName = "ltcd"
+			confDir = conf.Dir
+			confFile = "ltcd"
 		}
 
 		// If only ONE of RPCUser or RPCPass is set, we assume the
@@ -984,18 +1062,11 @@ func parseRPCParams(cConfig *chainConfig, nodeConfig interface{}, net chainCode,
 				"%[1]v.rpcuser, %[1]v.rpcpass", daemonName)
 		}
 
-		switch net {
-		case bitcoinChain:
-			confDir = conf.Dir
-			confFile = "btcd"
-		case litecoinChain:
-			confDir = conf.Dir
-			confFile = "ltcd"
-		}
 	case *bitcoindConfig:
-		// If all of RPCUser, RPCPass, and ZMQPath are set, we assume
-		// those parameters are good to use.
-		if conf.RPCUser != "" && conf.RPCPass != "" && conf.ZMQPath != "" {
+		// If all of RPCUser, RPCPass, ZMQBlockHost, and ZMQTxHost are
+		// set, we assume those parameters are good to use.
+		if conf.RPCUser != "" && conf.RPCPass != "" &&
+			conf.ZMQPubRawBlock != "" && conf.ZMQPubRawTx != "" {
 			return nil
 		}
 
@@ -1003,24 +1074,23 @@ func parseRPCParams(cConfig *chainConfig, nodeConfig interface{}, net chainCode,
 		switch net {
 		case bitcoinChain:
 			daemonName = "bitcoind"
-		case litecoinChain:
-			daemonName = "litecoind"
-		}
-		// If only one or two of the parameters are set, we assume the
-		// user did that unintentionally.
-		if conf.RPCUser != "" || conf.RPCPass != "" || conf.ZMQPath != "" {
-			return fmt.Errorf("please set all or none of "+
-				"%[1]v.rpcuser, %[1]v.rpcpass, "+
-				"and %[1]v.zmqpath", daemonName)
-		}
-
-		switch net {
-		case bitcoinChain:
 			confDir = conf.Dir
 			confFile = "bitcoin"
 		case litecoinChain:
+			daemonName = "litecoind"
 			confDir = conf.Dir
 			confFile = "litecoin"
+		}
+
+		// If only one or two of the parameters are set, we assume the
+		// user did that unintentionally.
+		if conf.RPCUser != "" || conf.RPCPass != "" ||
+			conf.ZMQPubRawBlock != "" || conf.ZMQPubRawTx != "" {
+
+			return fmt.Errorf("please set all or none of "+
+				"%[1]v.rpcuser, %[1]v.rpcpass, "+
+				"%[1]v.zmqpubrawblock, %[1]v.zmqpubrawtx",
+				daemonName)
 		}
 	}
 
@@ -1048,13 +1118,15 @@ func parseRPCParams(cConfig *chainConfig, nodeConfig interface{}, net chainCode,
 		nConf.RPCUser, nConf.RPCPass = rpcUser, rpcPass
 	case "bitcoind", "litecoind":
 		nConf := nodeConfig.(*bitcoindConfig)
-		rpcUser, rpcPass, zmqPath, err := extractBitcoindRPCParams(confFile)
+		rpcUser, rpcPass, zmqBlockHost, zmqTxHost, err :=
+			extractBitcoindRPCParams(confFile)
 		if err != nil {
 			return fmt.Errorf("unable to extract RPC credentials:"+
 				" %v, cannot start w/o RPC connection",
 				err)
 		}
-		nConf.RPCUser, nConf.RPCPass, nConf.ZMQPath = rpcUser, rpcPass, zmqPath
+		nConf.RPCUser, nConf.RPCPass = rpcUser, rpcPass
+		nConf.ZMQPubRawBlock, nConf.ZMQPubRawTx = zmqBlockHost, zmqTxHost
 	}
 
 	fmt.Printf("Automatically obtained %v's RPC credentials\n", daemonName)
@@ -1112,13 +1184,12 @@ func extractBtcdRPCParams(btcdConfigPath string) (string, string, error) {
 // location of bitcoind's bitcoin.conf on the target system. The routine looks
 // for a cookie first, optionally following the datadir configuration option in
 // the bitcoin.conf. If it doesn't find one, it looks for rpcuser/rpcpassword.
-func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string, error) {
-
+func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string, string, error) {
 	// First, we'll open up the bitcoind configuration file found at the
 	// target destination.
 	bitcoindConfigFile, err := os.Open(bitcoindConfigPath)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	defer bitcoindConfigFile.Close()
 
@@ -1126,18 +1197,36 @@ func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string
 	// we can attempt to locate the RPC credentials.
 	configContents, err := ioutil.ReadAll(bitcoindConfigFile)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 
-	// First, we look for the ZMQ path for raw blocks. If raw transactions
-	// are sent over this interface, we can also get unconfirmed txs.
-	zmqPathRE, err := regexp.Compile(`(?m)^\s*zmqpubrawblock\s*=\s*([^\s]+)`)
+	// First, we'll look for the ZMQ hosts providing raw block and raw
+	// transaction notifications.
+	zmqBlockHostRE, err := regexp.Compile(
+		`(?m)^\s*zmqpubrawblock\s*=\s*([^\s]+)`,
+	)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
-	zmqPathSubmatches := zmqPathRE.FindSubmatch(configContents)
-	if len(zmqPathSubmatches) < 2 {
-		return "", "", "", fmt.Errorf("unable to find zmqpubrawblock in config")
+	zmqBlockHostSubmatches := zmqBlockHostRE.FindSubmatch(configContents)
+	if len(zmqBlockHostSubmatches) < 2 {
+		return "", "", "", "", fmt.Errorf("unable to find " +
+			"zmqpubrawblock in config")
+	}
+	zmqTxHostRE, err := regexp.Compile(`(?m)^\s*zmqpubrawtx\s*=\s*([^\s]+)`)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	zmqTxHostSubmatches := zmqTxHostRE.FindSubmatch(configContents)
+	if len(zmqTxHostSubmatches) < 2 {
+		return "", "", "", "", errors.New("unable to find zmqpubrawtx " +
+			"in config")
+	}
+	zmqBlockHost := string(zmqBlockHostSubmatches[1])
+	zmqTxHost := string(zmqTxHostSubmatches[1])
+	if zmqBlockHost == zmqTxHost {
+		return "", "", "", "", errors.New("zmqpubrawblock and " +
+			"zmqpubrawtx must be different")
 	}
 
 	// Next, we'll try to find an auth cookie. We need to detect the chain
@@ -1145,7 +1234,7 @@ func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string
 	dataDir := path.Dir(bitcoindConfigPath)
 	dataDirRE, err := regexp.Compile(`(?m)^\s*datadir\s*=\s*([^\s]+)`)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	dataDirSubmatches := dataDirRE.FindSubmatch(configContents)
 	if dataDirSubmatches != nil {
@@ -1166,8 +1255,8 @@ func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string
 	if err == nil {
 		splitCookie := strings.Split(string(cookie), ":")
 		if len(splitCookie) == 2 {
-			return splitCookie[0], splitCookie[1],
-				string(zmqPathSubmatches[1]), nil
+			return splitCookie[0], splitCookie[1], zmqBlockHost,
+				zmqTxHost, nil
 		}
 	}
 
@@ -1176,11 +1265,12 @@ func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string
 	// expression then we'll exit with an error.
 	rpcUserRegexp, err := regexp.Compile(`(?m)^\s*rpcuser\s*=\s*([^\s]+)`)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	userSubmatches := rpcUserRegexp.FindSubmatch(configContents)
 	if userSubmatches == nil {
-		return "", "", "", fmt.Errorf("unable to find rpcuser in config")
+		return "", "", "", "", fmt.Errorf("unable to find rpcuser in " +
+			"config")
 	}
 
 	// Similarly, we'll use another regular expression to find the set
@@ -1188,84 +1278,16 @@ func extractBitcoindRPCParams(bitcoindConfigPath string) (string, string, string
 	// error.
 	rpcPassRegexp, err := regexp.Compile(`(?m)^\s*rpcpassword\s*=\s*([^\s]+)`)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", "", err
 	}
 	passSubmatches := rpcPassRegexp.FindSubmatch(configContents)
 	if passSubmatches == nil {
-		return "", "", "", fmt.Errorf("unable to find rpcpassword in config")
+		return "", "", "", "", fmt.Errorf("unable to find rpcpassword " +
+			"in config")
 	}
 
 	return string(userSubmatches[1]), string(passSubmatches[1]),
-		string(zmqPathSubmatches[1]), nil
-}
-
-// normalizeAddresses returns a new slice with all the passed addresses
-// normalized with the given default port and all duplicates removed.
-func normalizeAddresses(addrs []string, defaultPort string) []string {
-	result := make([]string, 0, len(addrs))
-	seen := map[string]struct{}{}
-	for _, addr := range addrs {
-		addr = normalizeAddress(addr, defaultPort)
-		if _, ok := seen[addr]; !ok {
-			result = append(result, addr)
-			seen[addr] = struct{}{}
-		}
-	}
-	return result
-}
-
-// normalizeAddress normalizes an address by either setting a missing host to
-// localhost or missing port to the default port.
-func normalizeAddress(addr, defaultPort string) string {
-	if _, _, err := net.SplitHostPort(addr); err != nil {
-		// If the address is an integer, then we assume it is *only* a
-		// port and default to binding to that port on localhost.
-		if _, err := strconv.Atoi(addr); err == nil {
-			return net.JoinHostPort("localhost", addr)
-		}
-
-		// Otherwise, the address only contains the host so we'll use
-		// the default port.
-		return net.JoinHostPort(addr, defaultPort)
-	}
-
-	return addr
-}
-
-// enforceSafeAuthentication enforces "safe" authentication taking into account
-// the interfaces that the RPC servers are listening on, and if macaroons are
-// activated or not. To project users from using dangerous config combinations,
-// we'll prevent disabling authentication if the sever is listening on a public
-// interface.
-func enforceSafeAuthentication(addrs []string, macaroonsActive bool) error {
-	isLoopback := func(addr string) bool {
-		loopBackAddrs := []string{"localhost", "127.0.0.1", "[::1]"}
-		for _, loopback := range loopBackAddrs {
-			if strings.Contains(addr, loopback) {
-				return true
-			}
-		}
-
-		return false
-	}
-
-	// We'll now examine all addresses that this RPC server is listening
-	// on. If it's a localhost address, we'll skip it, otherwise, we'll
-	// return an error if macaroons are inactive.
-	for _, addr := range addrs {
-		if isLoopback(addr) {
-			continue
-		}
-
-		if !macaroonsActive {
-			return fmt.Errorf("Detected RPC server listening on "+
-				"publicly reachable interface %v with "+
-				"authentication disabled! Refusing to start with "+
-				"--no-macaroons specified.", addr)
-		}
-	}
-
-	return nil
+		zmqBlockHost, zmqTxHost, nil
 }
 
 // normalizeNetwork returns the common name of a network type used to create
