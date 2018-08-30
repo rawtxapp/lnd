@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/signal"
 )
 
 var (
@@ -43,7 +44,8 @@ func SetStdout(lndHomeDir *C.char) {
 
 //export StopLnd
 func StopLnd() bool {
-	shutdownRequestChannel <- struct{}{}
+	// shutdownRequestChannel <- struct{}{}
+	signal.RequestShutdown()
 	success := <-shutdownSuccessChannel
 	shutdownStdout()
 	return success

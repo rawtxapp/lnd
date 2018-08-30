@@ -658,7 +658,7 @@ func loadConfig() (*config, error) {
 				"bitcoin's mainnet"
 			err := fmt.Errorf(str, funcName)
 			return nil, err
-		}*/
+		}
 
 		if cfg.Bitcoin.TimeLockDelta < minTimeLockDelta {
 			return nil, fmt.Errorf("timelockdelta must be at least %v",

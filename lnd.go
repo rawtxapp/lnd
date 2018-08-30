@@ -861,8 +861,8 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 	case <-signal.ShutdownChannel():
 		return nil, fmt.Errorf("shutting down")
 
-	case <-shutdownRequestChannel:
-		shutdownSuccessChannel <- true
-		return nil, fmt.Errorf("shutting down")
+		// case <-signal.shutdownRequestChannel:
+		// 	shutdownSuccessChannel <- true
+		// 	return nil, fmt.Errorf("shutting down")
 	}
 }
