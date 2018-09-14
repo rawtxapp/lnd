@@ -109,11 +109,10 @@ func setDefaultVars(lndHomeDir string) {
 	defaultLndDir = lndHomeDir
 	defaultConfigFile = filepath.Join(defaultLndDir, defaultConfigFilename)
 	defaultDataDir = filepath.Join(defaultLndDir, defaultDataDirname)
+	defaultLogDir = filepath.Join(defaultLndDir, defaultLogDirname)
+
 	defaultTLSCertPath = filepath.Join(defaultLndDir, defaultTLSCertFilename)
 	defaultTLSKeyPath = filepath.Join(defaultLndDir, defaultTLSKeyFilename)
-	defaultAdminMacPath = filepath.Join(defaultLndDir, defaultAdminMacFilename)
-	defaultReadMacPath = filepath.Join(defaultLndDir, defaultReadMacFilename)
-	defaultLogDir = filepath.Join(defaultLndDir, defaultLogDirname)
 
 	defaultBtcdDir = filepath.Join(lndHomeDir, "btcd", "default")
 	defaultBtcdRPCCertFile = filepath.Join(defaultBtcdDir, "rpc.cert")
