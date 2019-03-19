@@ -37,6 +37,10 @@ import (
 	"github.com/btcsuite/btcwallet/wallet"
 	proxy "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	flags "github.com/jessevdk/go-flags"
+	"github.com/lightninglabs/neutrino"
+
+	"github.com/lightningnetwork/lnd/autopilot"
+	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lncfg"
@@ -54,10 +58,6 @@ const (
 )
 
 var (
-	// Commit stores the current commit hash of this build. This should be
-	// set using -ldflags during compilation.
-	Commit string
-
 	cfg              *config
 	registeredChains = newChainRegistry()
 
@@ -93,12 +93,6 @@ var (
 // defers created in the top-level scope of a main method aren't executed if
 // os.Exit() is called.
 func lndMain() error {
-	defer func() {
-		if logRotatorPipe != nil {
-			ltndLog.Info("Shutdown complete")
-		}
-	}()
-
 	// Load the configuration, and parse any command line options. This
 	// function will also set up logging properly.
 	loadedConfig, err := loadConfig()
@@ -108,12 +102,14 @@ func lndMain() error {
 	cfg = loadedConfig
 	defer func() {
 		if logRotator != nil {
+			ltndLog.Info("Shutdown complete")
 			logRotator.Close()
 		}
 	}()
 
 	// Show version at startup.
-	ltndLog.Infof("Version %s", version())
+	ltndLog.Infof("Version: %s, build=%s, logging=%s",
+		build.Version(), build.Deployment, build.LoggingType)
 
 	var network string
 	switch {
@@ -201,6 +197,25 @@ func lndMain() error {
 	}
 	proxyOpts := []grpc.DialOption{grpc.WithTransportCredentials(cCreds)}
 
+	// Before starting the wallet, we'll create and start our Neutrino
+	// light client instance, if enabled, in order to allow it to sync
+	// while the rest of the daemon continues startup.
+	mainChain := cfg.Bitcoin
+	if registeredChains.PrimaryChain() == litecoinChain {
+		mainChain = cfg.Litecoin
+	}
+	var neutrinoCS *neutrino.ChainService
+	if mainChain.Node == "neutrino" {
+		neutrinoBackend, neutrinoCleanUp, err := initNeutrinoBackend(
+			mainChain.ChainDir,
+		)
+		defer neutrinoCleanUp()
+		if err != nil {
+			return err
+		}
+		neutrinoCS = neutrinoBackend
+	}
+
 	var (
 		privateWalletPw = lnwallet.DefaultPrivatePassphrase
 		publicWalletPw  = lnwallet.DefaultPublicPassphrase
@@ -274,7 +289,7 @@ func lndMain() error {
 	// Lightning Network Daemon.
 	activeChainControl, chainCleanUp, err := newChainControlFromConfig(
 		cfg, chanDB, privateWalletPw, publicWalletPw, birthday,
-		recoveryWindow, unlockedWallet,
+		recoveryWindow, unlockedWallet, neutrinoCS,
 	)
 	if err != nil {
 		fmt.Printf("unable to create chain control: %v\n", err)
@@ -318,66 +333,40 @@ func lndMain() error {
 		return err
 	}
 
-	// Check macaroon authentication if macaroons aren't disabled.
-	if macaroonService != nil {
-		serverOpts = append(serverOpts,
-			grpc.UnaryInterceptor(macaroonService.
-				UnaryServerInterceptor(permissions)),
-			grpc.StreamInterceptor(macaroonService.
-				StreamServerInterceptor(permissions)),
-		)
+	// Set up an autopilot manager from the current config. This will be
+	// used to manage the underlying autopilot agent, starting and stopping
+	// it at will.
+	atplCfg, err := initAutoPilot(server, cfg.Autopilot)
+	if err != nil {
+		ltndLog.Errorf("unable to init autopilot: %v", err)
+		return err
 	}
+
+	atplManager, err := autopilot.NewManager(atplCfg)
+	if err != nil {
+		ltndLog.Errorf("unable to create autopilot manager: %v", err)
+		return err
+	}
+	if err := atplManager.Start(); err != nil {
+		ltndLog.Errorf("unable to start autopilot manager: %v", err)
+		return err
+	}
+	defer atplManager.Stop()
 
 	// Initialize, and register our implementation of the gRPC interface
 	// exported by the rpcServer.
-	rpcServer := newRPCServer(server)
+	rpcServer, err := newRPCServer(
+		server, macaroonService, cfg.SubRPCServers, serverOpts,
+		proxyOpts, atplManager, server.invoices, tlsConf,
+	)
+	if err != nil {
+		srvrLog.Errorf("unable to start RPC server: %v", err)
+		return err
+	}
 	if err := rpcServer.Start(); err != nil {
 		return err
 	}
 	defer rpcServer.Stop()
-
-	grpcServer := grpc.NewServer(serverOpts...)
-	lnrpc.RegisterLightningServer(grpcServer, rpcServer)
-
-	// Next, Start the gRPC server listening for HTTP/2 connections.
-	for _, listener := range cfg.RPCListeners {
-		lis, err := lncfg.ListenOnAddress(listener)
-		if err != nil {
-			ltndLog.Errorf(
-				"RPC server unable to listen on %s", listener,
-			)
-			return err
-		}
-		defer lis.Close()
-		go func() {
-			rpcsLog.Infof("RPC server listening on %s", lis.Addr())
-			grpcServer.Serve(lis)
-		}()
-	}
-
-	// Finally, start the REST proxy for our gRPC server above.
-	mux := proxy.NewServeMux()
-	err = lnrpc.RegisterLightningHandlerFromEndpoint(
-		ctx, mux, cfg.RPCListeners[0].String(), proxyOpts,
-	)
-	if err != nil {
-		return err
-	}
-	for _, restEndpoint := range cfg.RESTListeners {
-		lis, err := lncfg.TLSListenOnAddress(restEndpoint, tlsConf)
-		if err != nil {
-			ltndLog.Errorf(
-				"gRPC proxy unable to listen on %s",
-				restEndpoint,
-			)
-			return err
-		}
-		defer lis.Close()
-		go func() {
-			rpcsLog.Infof("gRPC proxy started at %s", lis.Addr())
-			http.Serve(lis, mux)
-		}()
-	}
 
 	// If we're not in simnet mode, We'll wait until we're fully synced to
 	// continue the start up of the remainder of the daemon. This ensures
@@ -427,20 +416,14 @@ func lndMain() error {
 	defer server.Stop()
 
 	// Now that the server has started, if the autopilot mode is currently
-	// active, then we'll initialize a fresh instance of it and start it.
+	// active, then we'll start the autopilot agent immediately. It will be
+	// stopped together with the autopilot service.
 	if cfg.Autopilot.Active {
-		pilot, err := initAutoPilot(server, cfg.Autopilot)
-		if err != nil {
-			ltndLog.Errorf("unable to create autopilot agent: %v",
-				err)
-			return err
-		}
-		if err := pilot.Start(); err != nil {
+		if err := atplManager.StartAgent(); err != nil {
 			ltndLog.Errorf("unable to start autopilot agent: %v",
 				err)
 			return err
 		}
-		defer pilot.Stop()
 	}
 
 	// Wait for shutdown signal from either a graceful server stop or from
@@ -565,7 +548,7 @@ func genCertPair(certFile, keyFile string) error {
 
 		KeyUsage: x509.KeyUsageKeyEncipherment |
 			x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		IsCA: true, // so can sign self.
+		IsCA:                  true, // so can sign self.
 		BasicConstraintsValid: true,
 
 		DNSNames:    dnsNames,
@@ -609,9 +592,9 @@ func genCertPair(certFile, keyFile string) error {
 	return nil
 }
 
-// genMacaroons generates three macaroon files; one admin-level, one
-// for invoice access and one read-only. These can also be used
-// to generate more granular macaroons.
+// genMacaroons generates three macaroon files; one admin-level, one for
+// invoice access and one read-only. These can also be used to generate more
+// granular macaroons.
 func genMacaroons(ctx context.Context, svc *macaroons.Service,
 	admFile, roFile, invoiceFile string) error {
 

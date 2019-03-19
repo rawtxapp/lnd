@@ -3,9 +3,12 @@ package channeldb
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/btcsuite/btcd/btcec"
@@ -99,6 +102,15 @@ var (
 	// ErrNoCommitPoint is returned when no data loss commit point is found
 	// in the database.
 	ErrNoCommitPoint = fmt.Errorf("no commit point found")
+
+	// ErrNoRestoredChannelMutation is returned when a caller attempts to
+	// mutate a channel that's been recovered.
+	ErrNoRestoredChannelMutation = fmt.Errorf("cannot mutate restored " +
+		"channel state")
+
+	// ErrChanBorked is returned when a caller attempts to mutate a borked
+	// channel.
+	ErrChanBorked = fmt.Errorf("cannot mutate borked channel")
 )
 
 // ChannelType is an enum-like type that describes one of several possible
@@ -160,6 +172,13 @@ type ChannelConstraints struct {
 	// acted upon in the case of a unilateral channel closure or a contract
 	// breach.
 	MaxAcceptedHtlcs uint16
+
+	// CsvDelay is the relative time lock delay expressed in blocks. Any
+	// settled outputs that pay to the owner of this channel configuration
+	// MUST ensure that the delay branch uses this value as the relative
+	// time lock. Similarly, any HTLC's offered by this node should use
+	// this value as well.
+	CsvDelay uint16
 }
 
 // ChannelConfig is a struct that houses the various configuration opens for
@@ -174,13 +193,6 @@ type ChannelConfig struct {
 	// parameters, also including the smallest HTLC that will be accepted
 	// by a participant.
 	ChannelConstraints
-
-	// CsvDelay is the relative time lock delay expressed in blocks. Any
-	// settled outputs that pay to the owner of this channel configuration
-	// MUST ensure that the delay branch uses this value as the relative
-	// time lock. Similarly, any HTLC's offered by this node should use
-	// this value as well.
-	CsvDelay uint16
 
 	// MultiSigKey is the key to be used within the 2-of-2 output script
 	// for the owner of this channel config.
@@ -292,40 +304,81 @@ type ChannelCommitment struct {
 type ChannelStatus uint8
 
 var (
-	// Default is the normal state of an open channel.
-	Default ChannelStatus
+	// ChanStatusDefault is the normal state of an open channel.
+	ChanStatusDefault ChannelStatus
 
-	// Borked indicates that the channel has entered an irreconcilable
-	// state, triggered by a state desynchronization or channel breach.
-	// Channels in this state should never be added to the htlc switch.
-	Borked ChannelStatus = 1
+	// ChanStatusBorked indicates that the channel has entered an
+	// irreconcilable state, triggered by a state desynchronization or
+	// channel breach.  Channels in this state should never be added to the
+	// htlc switch.
+	ChanStatusBorked ChannelStatus = 1
 
-	// CommitmentBroadcasted indicates that a commitment for this channel
-	// has been broadcasted.
-	CommitmentBroadcasted ChannelStatus = 1 << 1
+	// ChanStatusCommitBroadcasted indicates that a commitment for this
+	// channel has been broadcasted.
+	ChanStatusCommitBroadcasted ChannelStatus = 1 << 1
 
-	// LocalDataLoss indicates that we have lost channel state for this
-	// channel, and broadcasting our latest commitment might be considered
-	// a breach.
+	// ChanStatusLocalDataLoss indicates that we have lost channel state
+	// for this channel, and broadcasting our latest commitment might be
+	// considered a breach.
+	//
 	// TODO(halseh): actually enforce that we are not force closing such a
 	// channel.
-	LocalDataLoss ChannelStatus = 1 << 2
+	ChanStatusLocalDataLoss ChannelStatus = 1 << 2
+
+	// ChanStatusRestored is a status flag that signals that the channel
+	// has been restored, and doesn't have all the fields a typical channel
+	// will have.
+	ChanStatusRestored ChannelStatus = 1 << 3
 )
+
+// chanStatusStrings maps a ChannelStatus to a human friendly string that
+// describes that status.
+var chanStatusStrings = map[ChannelStatus]string{
+	ChanStatusDefault:           "ChanStatusDefault",
+	ChanStatusBorked:            "ChanStatusBorked",
+	ChanStatusCommitBroadcasted: "ChanStatusCommitBroadcasted",
+	ChanStatusLocalDataLoss:     "ChanStatusLocalDataLoss",
+	ChanStatusRestored:          "ChanStatusRestored",
+}
+
+// orderedChanStatusFlags is an in-order list of all that channel status flags.
+var orderedChanStatusFlags = []ChannelStatus{
+	ChanStatusDefault,
+	ChanStatusBorked,
+	ChanStatusCommitBroadcasted,
+	ChanStatusLocalDataLoss,
+	ChanStatusRestored,
+}
 
 // String returns a human-readable representation of the ChannelStatus.
 func (c ChannelStatus) String() string {
-	switch c {
-	case Default:
-		return "Default"
-	case Borked:
-		return "Borked"
-	case CommitmentBroadcasted:
-		return "CommitmentBroadcasted"
-	case LocalDataLoss:
-		return "LocalDataLoss"
-	default:
-		return fmt.Sprintf("Unknown(%08b)", c)
+	// If no flags are set, then this is the default case.
+	if c == 0 {
+		return chanStatusStrings[ChanStatusDefault]
 	}
+
+	// Add individual bit flags.
+	statusStr := ""
+	for _, flag := range orderedChanStatusFlags {
+		if c&flag == flag {
+			statusStr += chanStatusStrings[flag] + "|"
+			c -= flag
+		}
+	}
+
+	// Remove anything to the right of the final bar, including it as well.
+	statusStr = strings.TrimRight(statusStr, "|")
+
+	// Add any remaining flags which aren't accounted for as hex.
+	if c != 0 {
+		statusStr += "|0x" + strconv.FormatUint(uint64(c), 16)
+	}
+
+	// If this was purely an unknown flag, then remove the extra bar at the
+	// start of the string.
+	statusStr = strings.TrimLeft(statusStr, "|")
+
+	return statusStr
 }
 
 // OpenChannel encapsulates the persistent and dynamic state of an open channel
@@ -487,6 +540,38 @@ func (c *OpenChannel) ChanStatus() ChannelStatus {
 	return c.chanStatus
 }
 
+// ApplyChanStatus allows the caller to modify the internal channel state in a
+// thead-safe manner.
+func (c *OpenChannel) ApplyChanStatus(status ChannelStatus) error {
+	c.Lock()
+	defer c.Unlock()
+
+	return c.putChanStatus(status)
+}
+
+// ClearChanStatus allows the caller to clear a particular channel status from
+// the primary channel status bit field. After this method returns, a call to
+// HasChanStatus(status) should return false.
+func (c *OpenChannel) ClearChanStatus(status ChannelStatus) error {
+	c.Lock()
+	defer c.Unlock()
+
+	return c.clearChanStatus(status)
+}
+
+// HasChanStatus returns true if the internal bitfield channel status of the
+// target channel has the specified status bit set.
+func (c *OpenChannel) HasChanStatus(status ChannelStatus) bool {
+	c.RLock()
+	defer c.RUnlock()
+
+	return c.hasChanStatus(status)
+}
+
+func (c *OpenChannel) hasChanStatus(status ChannelStatus) bool {
+	return c.chanStatus&status == status
+}
+
 // RefreshShortChanID updates the in-memory short channel ID using the latest
 // value observed on disk.
 func (c *OpenChannel) RefreshShortChanID() error {
@@ -494,8 +579,8 @@ func (c *OpenChannel) RefreshShortChanID() error {
 	defer c.Unlock()
 
 	var sid lnwire.ShortChannelID
-	err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
@@ -521,60 +606,11 @@ func (c *OpenChannel) RefreshShortChanID() error {
 	return nil
 }
 
-// updateChanBucket is a helper function that returns a writable bucket that a
+// fetchChanBucket is a helper function that returns the bucket where a
 // channel's data resides in given: the public key for the node, the outpoint,
 // and the chainhash that the channel resides on.
-//
-// NOTE: This function assumes that all the relevant descendent buckets already
-// exist.
-func updateChanBucket(tx *bolt.Tx, nodeKey *btcec.PublicKey,
-	outPoint *wire.OutPoint, chainHash chainhash.Hash) (*bolt.Bucket, error) {
-
-	// First fetch the top level bucket which stores all data related to
-	// current, active channels.
-	openChanBucket := tx.Bucket(openChannelBucket)
-	if openChanBucket == nil {
-		return nil, ErrNoChanDBExists
-	}
-
-	// Within this top level bucket, fetch the bucket dedicated to storing
-	// open channel data specific to the remote node.
-	nodePub := nodeKey.SerializeCompressed()
-	nodeChanBucket := openChanBucket.Bucket(nodePub)
-	if nodeChanBucket == nil {
-		return nil, ErrNoActiveChannels
-	}
-
-	// We'll then recurse down an additional layer in order to fetch the
-	// bucket for this particular chain.
-	chainBucket, err := nodeChanBucket.CreateBucketIfNotExists(chainHash[:])
-	if err != nil {
-		return nil, ErrNodeNotFound
-	}
-
-	// With the bucket for the node fetched, we can now go down another
-	// level, creating the bucket (if it doesn't exist), for this channel
-	// itself.
-	var chanPointBuf bytes.Buffer
-	if err := writeOutpoint(&chanPointBuf, outPoint); err != nil {
-		return nil, fmt.Errorf("unable to write outpoint: %v", err)
-	}
-	chanBucket, err := chainBucket.CreateBucketIfNotExists(
-		chanPointBuf.Bytes(),
-	)
-	if chanBucket == nil {
-		return nil, fmt.Errorf("unable to find bucket for "+
-			"chan_point=%v", outPoint)
-	}
-
-	return chanBucket, nil
-}
-
-// readChanBucket is a helper function that returns a readable bucket that a
-// channel's data resides in given: the public key for the node, the outpoint,
-// and the chainhash that the channel resides on.
-func readChanBucket(tx *bolt.Tx, nodeKey *btcec.PublicKey,
-	outPoint *wire.OutPoint, chainHash chainhash.Hash) (*bolt.Bucket, error) {
+func fetchChanBucket(tx *bbolt.Tx, nodeKey *btcec.PublicKey,
+	outPoint *wire.OutPoint, chainHash chainhash.Hash) (*bbolt.Bucket, error) {
 
 	// First fetch the top level bucket which stores all data related to
 	// current, active channels.
@@ -598,16 +634,15 @@ func readChanBucket(tx *bolt.Tx, nodeKey *btcec.PublicKey,
 		return nil, ErrNoActiveChannels
 	}
 
-	// With the bucket for the node fetched, we can now go down another
-	// level, for this channel itself.
+	// With the bucket for the node and chain fetched, we can now go down
+	// another level, for this channel itself.
 	var chanPointBuf bytes.Buffer
 	if err := writeOutpoint(&chanPointBuf, outPoint); err != nil {
 		return nil, err
 	}
-
 	chanBucket := chainBucket.Bucket(chanPointBuf.Bytes())
 	if chanBucket == nil {
-		return nil, ErrNoActiveChannels
+		return nil, ErrChannelNotFound
 	}
 
 	return chanBucket, nil
@@ -616,7 +651,7 @@ func readChanBucket(tx *bolt.Tx, nodeKey *btcec.PublicKey,
 // fullSync is an internal version of the FullSync method which allows callers
 // to sync the contents of an OpenChannel while re-using an existing database
 // transaction.
-func (c *OpenChannel) fullSync(tx *bolt.Tx) error {
+func (c *OpenChannel) fullSync(tx *bbolt.Tx) error {
 	// First fetch the top level bucket which stores all data related to
 	// current, active channels.
 	openChanBucket, err := tx.CreateBucketIfNotExists(openChannelBucket)
@@ -640,16 +675,20 @@ func (c *OpenChannel) fullSync(tx *bolt.Tx) error {
 	}
 
 	// With the bucket for the node fetched, we can now go down another
-	// level, creating the bucket (if it doesn't exist), for this channel
-	// itself.
+	// level, creating the bucket for this channel itself.
 	var chanPointBuf bytes.Buffer
 	if err := writeOutpoint(&chanPointBuf, &c.FundingOutpoint); err != nil {
 		return err
 	}
-	chanBucket, err := chainBucket.CreateBucketIfNotExists(
+	chanBucket, err := chainBucket.CreateBucket(
 		chanPointBuf.Bytes(),
 	)
-	if err != nil {
+	switch {
+	case err == bbolt.ErrBucketExists:
+		// If this channel already exists, then in order to avoid
+		// overriding it, we'll return an error back up to the caller.
+		return ErrChanAlreadyExists
+	case err != nil:
 		return err
 	}
 
@@ -662,8 +701,8 @@ func (c *OpenChannel) MarkAsOpen(openLoc lnwire.ShortChannelID) error {
 	c.Lock()
 	defer c.Unlock()
 
-	if err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := updateChanBucket(
+	if err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
@@ -698,8 +737,8 @@ func (c *OpenChannel) MarkDataLoss(commitPoint *btcec.PublicKey) error {
 	defer c.Unlock()
 
 	var status ChannelStatus
-	if err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := updateChanBucket(
+	if err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
@@ -713,7 +752,7 @@ func (c *OpenChannel) MarkDataLoss(commitPoint *btcec.PublicKey) error {
 
 		// Add status LocalDataLoss to the existing bitvector found in
 		// the DB.
-		status = channel.chanStatus | LocalDataLoss
+		status = channel.chanStatus | ChanStatusLocalDataLoss
 		channel.chanStatus = status
 
 		var b bytes.Buffer
@@ -742,12 +781,15 @@ func (c *OpenChannel) MarkDataLoss(commitPoint *btcec.PublicKey) error {
 func (c *OpenChannel) DataLossCommitPoint() (*btcec.PublicKey, error) {
 	var commitPoint *btcec.PublicKey
 
-	err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
-		if err == ErrNoActiveChannels || err == ErrNoChanDBExists {
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		switch err {
+		case nil:
+		case ErrNoChanDBExists, ErrNoActiveChannels, ErrChannelNotFound:
 			return ErrNoCommitPoint
-		} else if err != nil {
+		default:
 			return err
 		}
 
@@ -776,7 +818,21 @@ func (c *OpenChannel) MarkBorked() error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.putChanStatus(Borked)
+	return c.putChanStatus(ChanStatusBorked)
+}
+
+// isBorked returns true if the channel has been marked as borked in the
+// database. This requires an existing database transaction to already be
+// active.
+//
+// NOTE: The primary mutex should already be held before this method is called.
+func (c *OpenChannel) isBorked(chanBucket *bbolt.Bucket) (bool, error) {
+	channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+	if err != nil {
+		return false, err
+	}
+
+	return channel.chanStatus != ChanStatusDefault, nil
 }
 
 // MarkCommitmentBroadcasted marks the channel as a commitment transaction has
@@ -786,12 +842,12 @@ func (c *OpenChannel) MarkCommitmentBroadcasted() error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.putChanStatus(CommitmentBroadcasted)
+	return c.putChanStatus(ChanStatusCommitBroadcasted)
 }
 
 func (c *OpenChannel) putChanStatus(status ChannelStatus) error {
-	if err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := updateChanBucket(
+	if err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
@@ -818,9 +874,38 @@ func (c *OpenChannel) putChanStatus(status ChannelStatus) error {
 	return nil
 }
 
+func (c *OpenChannel) clearChanStatus(status ChannelStatus) error {
+	if err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		if err != nil {
+			return err
+		}
+
+		channel, err := fetchOpenChannel(chanBucket, &c.FundingOutpoint)
+		if err != nil {
+			return err
+		}
+
+		// Unset this bit in the bitvector on disk.
+		status = channel.chanStatus & ^status
+		channel.chanStatus = status
+
+		return putOpenChannel(chanBucket, channel)
+	}); err != nil {
+		return err
+	}
+
+	// Update the in-memory representation to keep it in sync with the DB.
+	c.chanStatus = status
+
+	return nil
+}
+
 // putChannel serializes, and stores the current state of the channel in its
 // entirety.
-func putOpenChannel(chanBucket *bolt.Bucket, channel *OpenChannel) error {
+func putOpenChannel(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	// First, we'll write out all the relatively static fields, that are
 	// decided upon initial channel creation.
 	if err := putChanInfo(chanBucket, channel); err != nil {
@@ -844,7 +929,7 @@ func putOpenChannel(chanBucket *bolt.Bucket, channel *OpenChannel) error {
 
 // fetchOpenChannel retrieves, and deserializes (including decrypting
 // sensitive) the complete channel currently active with the passed nodeID.
-func fetchOpenChannel(chanBucket *bolt.Bucket,
+func fetchOpenChannel(chanBucket *bbolt.Bucket,
 	chanPoint *wire.OutPoint) (*OpenChannel, error) {
 
 	channel := &OpenChannel{
@@ -891,34 +976,39 @@ func (c *OpenChannel) SyncPending(addr net.Addr, pendingHeight uint32) error {
 
 	c.FundingBroadcastHeight = pendingHeight
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
-		// First, sync all the persistent channel state to disk.
-		if err := c.fullSync(tx); err != nil {
-			return err
-		}
-
-		nodeInfoBucket, err := tx.CreateBucketIfNotExists(nodeInfoBucket)
-		if err != nil {
-			return err
-		}
-
-		// If a LinkNode for this identity public key already exists,
-		// then we can exit early.
-		nodePub := c.IdentityPub.SerializeCompressed()
-		if nodeInfoBucket.Get(nodePub) != nil {
-			return nil
-		}
-
-		// Next, we need to establish a (possibly) new LinkNode
-		// relationship for this channel. The LinkNode metadata
-		// contains reachability, up-time, and service bits related
-		// information.
-		linkNode := c.Db.NewLinkNode(wire.MainNet, c.IdentityPub, addr)
-
-		// TODO(roasbeef): do away with link node all together?
-
-		return putLinkNode(nodeInfoBucket, linkNode)
+	return c.Db.Update(func(tx *bbolt.Tx) error {
+		return syncNewChannel(tx, c, []net.Addr{addr})
 	})
+}
+
+// syncNewChannel will write the passed channel to disk, and also create a
+// LinkNode (if needed) for the channel peer.
+func syncNewChannel(tx *bbolt.Tx, c *OpenChannel, addrs []net.Addr) error {
+	// First, sync all the persistent channel state to disk.
+	if err := c.fullSync(tx); err != nil {
+		return err
+	}
+
+	nodeInfoBucket, err := tx.CreateBucketIfNotExists(nodeInfoBucket)
+	if err != nil {
+		return err
+	}
+
+	// If a LinkNode for this identity public key already exists,
+	// then we can exit early.
+	nodePub := c.IdentityPub.SerializeCompressed()
+	if nodeInfoBucket.Get(nodePub) != nil {
+		return nil
+	}
+
+	// Next, we need to establish a (possibly) new LinkNode relationship
+	// for this channel. The LinkNode metadata contains reachability,
+	// up-time, and service bits related information.
+	linkNode := c.Db.NewLinkNode(wire.MainNet, c.IdentityPub, addrs...)
+
+	// TODO(roasbeef): do away with link node all together?
+
+	return putLinkNode(nodeInfoBucket, linkNode)
 }
 
 // UpdateCommitment updates the commitment state for the specified party
@@ -930,12 +1020,29 @@ func (c *OpenChannel) UpdateCommitment(newCommitment *ChannelCommitment) error {
 	c.Lock()
 	defer c.Unlock()
 
-	err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := updateChanBucket(
+	// If this is a restored channel, then we want to avoid mutating the
+	// state as all, as it's impossible to do so in a protocol compliant
+	// manner.
+	if c.hasChanStatus(ChanStatusRestored) {
+		return ErrNoRestoredChannelMutation
+	}
+
+	err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
 			return err
+		}
+
+		// If the channel is marked as borked, then for safety reasons,
+		// we shouldn't attempt any further updates.
+		isBorked, err := c.isBorked(chanBucket)
+		if err != nil {
+			return err
+		}
+		if isBorked {
+			return ErrChanBorked
 		}
 
 		if err = putChanInfo(chanBucket, c); err != nil {
@@ -944,7 +1051,9 @@ func (c *OpenChannel) UpdateCommitment(newCommitment *ChannelCommitment) error {
 
 		// With the proper bucket fetched, we'll now write toe latest
 		// commitment state to dis for the target party.
-		err = putChanCommitment(chanBucket, newCommitment, true)
+		err = putChanCommitment(
+			chanBucket, newCommitment, true,
+		)
 		if err != nil {
 			return fmt.Errorf("unable to store chan "+
 				"revocations: %v", err)
@@ -1349,14 +1458,31 @@ func (c *OpenChannel) AppendRemoteCommitChain(diff *CommitDiff) error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
+	// If this is a restored channel, then we want to avoid mutating the
+	// state as all, as it's impossible to do so in a protocol compliant
+	// manner.
+	if c.hasChanStatus(ChanStatusRestored) {
+		return ErrNoRestoredChannelMutation
+	}
+
+	return c.Db.Update(func(tx *bbolt.Tx) error {
 		// First, we'll grab the writable bucket where this channel's
 		// data resides.
-		chanBucket, err := updateChanBucket(
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
 			return err
+		}
+
+		// If the channel is marked as borked, then for safety reasons,
+		// we shouldn't attempt any further updates.
+		isBorked, err := c.isBorked(chanBucket)
+		if err != nil {
+			return err
+		}
+		if isBorked {
+			return ErrChanBorked
 		}
 
 		// Any outgoing settles and fails necessarily have a
@@ -1399,12 +1525,15 @@ func (c *OpenChannel) AppendRemoteCommitChain(diff *CommitDiff) error {
 // these pointers, causing the tip and the tail to point to the same entry.
 func (c *OpenChannel) RemoteCommitChainTip() (*CommitDiff, error) {
 	var cd *CommitDiff
-	err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
-		if err == ErrNoActiveChannels || err == ErrNoChanDBExists {
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
+		switch err {
+		case nil:
+		case ErrNoChanDBExists, ErrNoActiveChannels, ErrChannelNotFound:
 			return ErrNoPendingCommit
-		} else if err != nil {
+		default:
 			return err
 		}
 
@@ -1442,8 +1571,8 @@ func (c *OpenChannel) InsertNextRevocation(revKey *btcec.PublicKey) error {
 
 	c.RemoteNextRevocation = revKey
 
-	err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := updateChanBucket(
+	err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
@@ -1470,14 +1599,31 @@ func (c *OpenChannel) AdvanceCommitChainTail(fwdPkg *FwdPkg) error {
 	c.Lock()
 	defer c.Unlock()
 
+	// If this is a restored channel, then we want to avoid mutating the
+	// state as all, as it's impossible to do so in a protocol compliant
+	// manner.
+	if c.hasChanStatus(ChanStatusRestored) {
+		return ErrNoRestoredChannelMutation
+	}
+
 	var newRemoteCommit *ChannelCommitment
 
-	err := c.Db.Update(func(tx *bolt.Tx) error {
-		chanBucket, err := updateChanBucket(
+	err := c.Db.Update(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
 			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
 		)
 		if err != nil {
 			return err
+		}
+
+		// If the channel is marked as borked, then for safety reasons,
+		// we shouldn't attempt any further updates.
+		isBorked, err := c.isBorked(chanBucket)
+		if err != nil {
+			return err
+		}
+		if isBorked {
+			return ErrChanBorked
 		}
 
 		// Persist the latest preimage state to disk as the remote peer
@@ -1509,7 +1655,9 @@ func (c *OpenChannel) AdvanceCommitChainTail(fwdPkg *FwdPkg) error {
 		if err != nil {
 			return err
 		}
-		err = putChanCommitment(chanBucket, &newCommit.Commitment, false)
+		err = putChanCommitment(
+			chanBucket, &newCommit.Commitment, false,
+		)
 		if err != nil {
 			return err
 		}
@@ -1580,7 +1728,7 @@ func (c *OpenChannel) LoadFwdPkgs() ([]*FwdPkg, error) {
 	defer c.RUnlock()
 
 	var fwdPkgs []*FwdPkg
-	if err := c.Db.View(func(tx *bolt.Tx) error {
+	if err := c.Db.View(func(tx *bbolt.Tx) error {
 		var err error
 		fwdPkgs, err = c.Packager.LoadFwdPkgs(tx)
 		return err
@@ -1598,7 +1746,7 @@ func (c *OpenChannel) AckAddHtlcs(addRefs ...AddRef) error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
+	return c.Db.Update(func(tx *bbolt.Tx) error {
 		return c.Packager.AckAddHtlcs(tx, addRefs...)
 	})
 }
@@ -1611,7 +1759,7 @@ func (c *OpenChannel) AckSettleFails(settleFailRefs ...SettleFailRef) error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
+	return c.Db.Update(func(tx *bbolt.Tx) error {
 		return c.Packager.AckSettleFails(tx, settleFailRefs...)
 	})
 }
@@ -1622,7 +1770,7 @@ func (c *OpenChannel) SetFwdFilter(height uint64, fwdFilter *PkgFilter) error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
+	return c.Db.Update(func(tx *bbolt.Tx) error {
 		return c.Packager.SetFwdFilter(tx, height, fwdFilter)
 	})
 }
@@ -1635,15 +1783,14 @@ func (c *OpenChannel) RemoveFwdPkg(height uint64) error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
+	return c.Db.Update(func(tx *bbolt.Tx) error {
 		return c.Packager.RemovePkg(tx, height)
 	})
 }
 
 // RevocationLogTail returns the "tail", or the end of the current revocation
 // log. This entry represents the last previous state for the remote node's
-// commitment chain. The ChannelDelta returned by this method will always lag
-// one state behind the most current (unrevoked) state of the remote node's
+// commitment chain. The ChannelDelta returned by this method will always lag one state behind the most current (unrevoked) state of the remote node's
 // commitment chain.
 func (c *OpenChannel) RevocationLogTail() (*ChannelCommitment, error) {
 	c.RLock()
@@ -1656,9 +1803,10 @@ func (c *OpenChannel) RevocationLogTail() (*ChannelCommitment, error) {
 	}
 
 	var commit ChannelCommitment
-	if err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
+	if err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
 		if err != nil {
 			return err
 		}
@@ -1702,11 +1850,12 @@ func (c *OpenChannel) CommitmentHeight() (uint64, error) {
 	defer c.RUnlock()
 
 	var height uint64
-	err := c.Db.View(func(tx *bolt.Tx) error {
+	err := c.Db.View(func(tx *bbolt.Tx) error {
 		// Get the bucket dedicated to storing the metadata for open
 		// channels.
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
 		if err != nil {
 			return err
 		}
@@ -1736,9 +1885,10 @@ func (c *OpenChannel) FindPreviousState(updateNum uint64) (*ChannelCommitment, e
 	defer c.RUnlock()
 
 	var commit ChannelCommitment
-	err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
 		if err != nil {
 			return err
 		}
@@ -1792,6 +1942,11 @@ const (
 	// we or the remote fail at some point during the opening workflow, or
 	// we timeout waiting for the funding transaction to be confirmed.
 	FundingCanceled ClosureType = 3
+
+	// Abandoned indicates that the channel state was removed without
+	// any further actions. This is intended to clean up unusable
+	// channels during development.
+	Abandoned ClosureType = 5
 )
 
 // ChannelCloseSummary contains the final state of a channel at the point it
@@ -1869,6 +2024,10 @@ type ChannelCloseSummary struct {
 
 	// LocalChanCfg is the channel configuration for the local node.
 	LocalChanConfig ChannelConfig
+
+	// LastChanSyncMsg is the ChannelReestablish message for this channel
+	// for the state at the point where it was closed.
+	LastChanSyncMsg *lnwire.ChannelReestablish
 }
 
 // CloseChannel closes a previously active Lightning channel. Closing a channel
@@ -1880,7 +2039,7 @@ func (c *OpenChannel) CloseChannel(summary *ChannelCloseSummary) error {
 	c.Lock()
 	defer c.Unlock()
 
-	return c.Db.Update(func(tx *bolt.Tx) error {
+	return c.Db.Update(func(tx *bbolt.Tx) error {
 		openChanBucket := tx.Bucket(openChannelBucket)
 		if openChanBucket == nil {
 			return ErrNoChanDBExists
@@ -2024,9 +2183,10 @@ func (c *OpenChannel) Snapshot() *ChannelSnapshot {
 // latest fully committed state is returned. The first commitment returned is
 // the local commitment, and the second returned is the remote commitment.
 func (c *OpenChannel) LatestCommitments() (*ChannelCommitment, *ChannelCommitment, error) {
-	err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
 		if err != nil {
 			return err
 		}
@@ -2045,9 +2205,10 @@ func (c *OpenChannel) LatestCommitments() (*ChannelCommitment, *ChannelCommitmen
 // acting on a possible contract breach to ensure, that the caller has the most
 // up to date information required to deliver justice.
 func (c *OpenChannel) RemoteRevocationStore() (shachain.Store, error) {
-	err := c.Db.View(func(tx *bolt.Tx) error {
-		chanBucket, err := readChanBucket(tx, c.IdentityPub,
-			&c.FundingOutpoint, c.ChainHash)
+	err := c.Db.View(func(tx *bbolt.Tx) error {
+		chanBucket, err := fetchChanBucket(
+			tx, c.IdentityPub, &c.FundingOutpoint, c.ChainHash,
+		)
 		if err != nil {
 			return err
 		}
@@ -2061,7 +2222,7 @@ func (c *OpenChannel) RemoteRevocationStore() (shachain.Store, error) {
 	return c.RevocationStore, nil
 }
 
-func putChannelCloseSummary(tx *bolt.Tx, chanID []byte,
+func putChannelCloseSummary(tx *bbolt.Tx, chanID []byte,
 	summary *ChannelCloseSummary, lastChanState *OpenChannel) error {
 
 	closedChanBucket, err := tx.CreateBucketIfNotExists(closedChannelBucket)
@@ -2094,7 +2255,12 @@ func serializeChannelCloseSummary(w io.Writer, cs *ChannelCloseSummary) error {
 	// If this is a close channel summary created before the addition of
 	// the new fields, then we can exit here.
 	if cs.RemoteCurrentRevocation == nil {
-		return nil
+		return WriteElements(w, false)
+	}
+
+	// If fields are present, write boolean to indicate this, and continue.
+	if err := WriteElements(w, true); err != nil {
+		return err
 	}
 
 	if err := WriteElements(w, cs.RemoteCurrentRevocation); err != nil {
@@ -2105,17 +2271,37 @@ func serializeChannelCloseSummary(w io.Writer, cs *ChannelCloseSummary) error {
 		return err
 	}
 
-	// We'll write this field last, as it's possible for a channel to be
-	// closed before we learn of the next unrevoked revocation point for
-	// the remote party.
-	if cs.RemoteNextRevocation == nil {
-		return nil
+	// The RemoteNextRevocation field is optional, as it's possible for a
+	// channel to be closed before we learn of the next unrevoked
+	// revocation point for the remote party. Write a boolen indicating
+	// whether this field is present or not.
+	if err := WriteElements(w, cs.RemoteNextRevocation != nil); err != nil {
+		return err
 	}
 
-	return WriteElements(w, cs.RemoteNextRevocation)
+	// Write the field, if present.
+	if cs.RemoteNextRevocation != nil {
+		if err = WriteElements(w, cs.RemoteNextRevocation); err != nil {
+			return err
+		}
+	}
+
+	// Write whether the channel sync message is present.
+	if err := WriteElements(w, cs.LastChanSyncMsg != nil); err != nil {
+		return err
+	}
+
+	// Write the channel sync message, if present.
+	if cs.LastChanSyncMsg != nil {
+		if err := WriteElements(w, cs.LastChanSyncMsg); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func fetchChannelCloseSummary(tx *bolt.Tx,
+func fetchChannelCloseSummary(tx *bbolt.Tx,
 	chanID []byte) (*ChannelCloseSummary, error) {
 
 	closedChanBucket, err := tx.CreateBucketIfNotExists(closedChannelBucket)
@@ -2146,15 +2332,19 @@ func deserializeCloseChannelSummary(r io.Reader) (*ChannelCloseSummary, error) {
 
 	// We'll now check to see if the channel close summary was encoded with
 	// any of the additional optional fields.
-	err = ReadElements(r, &c.RemoteCurrentRevocation)
-	switch {
-	case err == io.EOF:
-		return c, nil
+	var hasNewFields bool
+	err = ReadElements(r, &hasNewFields)
+	if err != nil {
+		return nil, err
+	}
 
-	// If we got a non-eof error, then we know there's an actually issue.
-	// Otherwise, it may have been the case that this summary didn't have
-	// the set of optional fields.
-	case err != nil:
+	// If fields are not present, we can return.
+	if !hasNewFields {
+		return c, nil
+	}
+
+	// Otherwise read the new fields.
+	if err := ReadElements(r, &c.RemoteCurrentRevocation); err != nil {
 		return nil, err
 	}
 
@@ -2164,15 +2354,46 @@ func deserializeCloseChannelSummary(r io.Reader) (*ChannelCloseSummary, error) {
 
 	// Finally, we'll attempt to read the next unrevoked commitment point
 	// for the remote party. If we closed the channel before receiving a
-	// funding locked message, then this can be nil. As a result, we'll use
-	// the same technique to read the field, only if there's still data
-	// left in the buffer.
-	err = ReadElements(r, &c.RemoteNextRevocation)
-	if err != nil && err != io.EOF {
-		// If we got a non-eof error, then we know there's an actually
-		// issue. Otherwise, it may have been the case that this
-		// summary didn't have the set of optional fields.
+	// funding locked message then this might not be present. A boolean
+	// indicating whether the field is present will come first.
+	var hasRemoteNextRevocation bool
+	err = ReadElements(r, &hasRemoteNextRevocation)
+	if err != nil {
 		return nil, err
+	}
+
+	// If this field was written, read it.
+	if hasRemoteNextRevocation {
+		err = ReadElements(r, &c.RemoteNextRevocation)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Check if we have a channel sync message to read.
+	var hasChanSyncMsg bool
+	err = ReadElements(r, &hasChanSyncMsg)
+	if err == io.EOF {
+		return c, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	// If a chan sync message is present, read it.
+	if hasChanSyncMsg {
+		// We must pass in reference to a lnwire.Message for the codec
+		// to support it.
+		var msg lnwire.Message
+		if err := ReadElements(r, &msg); err != nil {
+			return nil, err
+		}
+
+		chanSync, ok := msg.(*lnwire.ChannelReestablish)
+		if !ok {
+			return nil, errors.New("unable cast db Message to " +
+				"ChannelReestablish")
+		}
+		c.LastChanSyncMsg = chanSync
 	}
 
 	return c, nil
@@ -2187,7 +2408,7 @@ func writeChanConfig(b io.Writer, c *ChannelConfig) error {
 	)
 }
 
-func putChanInfo(chanBucket *bolt.Bucket, channel *OpenChannel) error {
+func putChanInfo(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	var w bytes.Buffer
 	if err := WriteElements(&w,
 		channel.ChanType, channel.ChainHash, channel.FundingOutpoint,
@@ -2230,7 +2451,7 @@ func serializeChanCommit(w io.Writer, c *ChannelCommitment) error {
 	return SerializeHtlcs(w, c.Htlcs...)
 }
 
-func putChanCommitment(chanBucket *bolt.Bucket, c *ChannelCommitment,
+func putChanCommitment(chanBucket *bbolt.Bucket, c *ChannelCommitment,
 	local bool) error {
 
 	var commitKey []byte
@@ -2248,16 +2469,26 @@ func putChanCommitment(chanBucket *bolt.Bucket, c *ChannelCommitment,
 	return chanBucket.Put(commitKey, b.Bytes())
 }
 
-func putChanCommitments(chanBucket *bolt.Bucket, channel *OpenChannel) error {
-	err := putChanCommitment(chanBucket, &channel.LocalCommitment, true)
+func putChanCommitments(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
+	// If this is a restored channel, then we don't have any commitments to
+	// write.
+	if channel.hasChanStatus(ChanStatusRestored) {
+		return nil
+	}
+
+	err := putChanCommitment(
+		chanBucket, &channel.LocalCommitment, true,
+	)
 	if err != nil {
 		return err
 	}
 
-	return putChanCommitment(chanBucket, &channel.RemoteCommitment, false)
+	return putChanCommitment(
+		chanBucket, &channel.RemoteCommitment, false,
+	)
 }
 
-func putChanRevocationState(chanBucket *bolt.Bucket, channel *OpenChannel) error {
+func putChanRevocationState(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 
 	var b bytes.Buffer
 	err := WriteElements(
@@ -2292,7 +2523,7 @@ func readChanConfig(b io.Reader, c *ChannelConfig) error {
 	)
 }
 
-func fetchChanInfo(chanBucket *bolt.Bucket, channel *OpenChannel) error {
+func fetchChanInfo(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	infoBytes := chanBucket.Get(chanInfoKey)
 	if infoBytes == nil {
 		return ErrNoChanInfoFound
@@ -2349,7 +2580,7 @@ func deserializeChanCommit(r io.Reader) (ChannelCommitment, error) {
 	return c, nil
 }
 
-func fetchChanCommitment(chanBucket *bolt.Bucket, local bool) (ChannelCommitment, error) {
+func fetchChanCommitment(chanBucket *bbolt.Bucket, local bool) (ChannelCommitment, error) {
 	var commitKey []byte
 	if local {
 		commitKey = append(chanCommitmentKey, byte(0x00))
@@ -2366,8 +2597,14 @@ func fetchChanCommitment(chanBucket *bolt.Bucket, local bool) (ChannelCommitment
 	return deserializeChanCommit(r)
 }
 
-func fetchChanCommitments(chanBucket *bolt.Bucket, channel *OpenChannel) error {
+func fetchChanCommitments(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	var err error
+
+	// If this is a restored channel, then we don't have any commitments to
+	// read.
+	if channel.hasChanStatus(ChanStatusRestored) {
+		return nil
+	}
 
 	channel.LocalCommitment, err = fetchChanCommitment(chanBucket, true)
 	if err != nil {
@@ -2381,7 +2618,7 @@ func fetchChanCommitments(chanBucket *bolt.Bucket, channel *OpenChannel) error {
 	return nil
 }
 
-func fetchChanRevocationState(chanBucket *bolt.Bucket, channel *OpenChannel) error {
+func fetchChanRevocationState(chanBucket *bbolt.Bucket, channel *OpenChannel) error {
 	revBytes := chanBucket.Get(revocationStateKey)
 	if revBytes == nil {
 		return ErrNoRevocationsFound
@@ -2407,7 +2644,7 @@ func fetchChanRevocationState(chanBucket *bolt.Bucket, channel *OpenChannel) err
 	return ReadElements(r, &channel.RemoteNextRevocation)
 }
 
-func deleteOpenChannel(chanBucket *bolt.Bucket, chanPointBytes []byte) error {
+func deleteOpenChannel(chanBucket *bbolt.Bucket, chanPointBytes []byte) error {
 
 	if err := chanBucket.Delete(chanInfoKey); err != nil {
 		return err
@@ -2448,7 +2685,7 @@ func readLogKey(b []byte) uint64 {
 	return byteOrder.Uint64(b)
 }
 
-func appendChannelLogEntry(log *bolt.Bucket,
+func appendChannelLogEntry(log *bbolt.Bucket,
 	commit *ChannelCommitment) error {
 
 	var b bytes.Buffer
@@ -2460,7 +2697,7 @@ func appendChannelLogEntry(log *bolt.Bucket,
 	return log.Put(logEntrykey[:], b.Bytes())
 }
 
-func fetchChannelLogEntry(log *bolt.Bucket,
+func fetchChannelLogEntry(log *bbolt.Bucket,
 	updateNum uint64) (ChannelCommitment, error) {
 
 	logEntrykey := makeLogKey(updateNum)
@@ -2473,7 +2710,7 @@ func fetchChannelLogEntry(log *bolt.Bucket,
 	return deserializeChanCommit(commitReader)
 }
 
-func wipeChannelLogEntries(log *bolt.Bucket) error {
+func wipeChannelLogEntries(log *bbolt.Bucket) error {
 	// TODO(roasbeef): comment
 
 	logCursor := log.Cursor()

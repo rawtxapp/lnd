@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,8 +11,12 @@ import (
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcwallet/wallet/txauthor"
+
 	"github.com/lightningnetwork/lnd/chainntnfs"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwallet"
 )
 
@@ -25,7 +28,7 @@ type mockSigner struct {
 }
 
 func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
-	signDesc *lnwallet.SignDescriptor) ([]byte, error) {
+	signDesc *input.SignDescriptor) ([]byte, error) {
 	amt := signDesc.Output.Value
 	witnessScript := signDesc.WitnessScript
 	privKey := m.key
@@ -36,10 +39,10 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
 
 	switch {
 	case signDesc.SingleTweak != nil:
-		privKey = lnwallet.TweakPrivKey(privKey,
+		privKey = input.TweakPrivKey(privKey,
 			signDesc.SingleTweak)
 	case signDesc.DoubleTweak != nil:
-		privKey = lnwallet.DeriveRevocationPrivKey(privKey,
+		privKey = input.DeriveRevocationPrivKey(privKey,
 			signDesc.DoubleTweak)
 	}
 
@@ -54,7 +57,7 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
 }
 
 func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx,
-	signDesc *lnwallet.SignDescriptor) (*lnwallet.InputScript, error) {
+	signDesc *input.SignDescriptor) (*input.Script, error) {
 
 	// TODO(roasbeef): expose tweaked signer from lnwallet so don't need to
 	// duplicate this code?
@@ -63,10 +66,10 @@ func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx,
 
 	switch {
 	case signDesc.SingleTweak != nil:
-		privKey = lnwallet.TweakPrivKey(privKey,
+		privKey = input.TweakPrivKey(privKey,
 			signDesc.SingleTweak)
 	case signDesc.DoubleTweak != nil:
-		privKey = lnwallet.DeriveRevocationPrivKey(privKey,
+		privKey = input.DeriveRevocationPrivKey(privKey,
 			signDesc.DoubleTweak)
 	}
 
@@ -77,7 +80,7 @@ func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx,
 		return nil, err
 	}
 
-	return &lnwallet.InputScript{
+	return &input.Script{
 		Witness: witnessScript,
 	}, nil
 }
@@ -168,10 +171,12 @@ func (m *mockSpendNotifier) Spend(outpoint *wire.OutPoint, height int32,
 	}
 }
 
-type mockChainIO struct{}
+type mockChainIO struct {
+	bestHeight int32
+}
 
-func (*mockChainIO) GetBestBlock() (*chainhash.Hash, int32, error) {
-	return activeNetParams.GenesisHash, fundingBroadcastHeight, nil
+func (m *mockChainIO) GetBestBlock() (*chainhash.Hash, int32, error) {
+	return activeNetParams.GenesisHash, m.bestHeight, nil
 }
 
 func (*mockChainIO) GetUtxo(op *wire.OutPoint, _ []byte,
@@ -222,19 +227,31 @@ func (m *mockWalletController) NewAddress(addrType lnwallet.AddressType,
 		m.rootKey.PubKey().SerializeCompressed(), &chaincfg.MainNetParams)
 	return addr, nil
 }
-func (*mockWalletController) GetPrivKey(a btcutil.Address) (*btcec.PrivateKey, error) {
+func (*mockWalletController) LastUnusedAddress(addrType lnwallet.AddressType) (
+	btcutil.Address, error) {
 	return nil, nil
 }
 
+func (*mockWalletController) IsOurAddress(a btcutil.Address) bool {
+	return false
+}
+
 func (*mockWalletController) SendOutputs(outputs []*wire.TxOut,
-	_ lnwallet.SatPerKWeight) (*chainhash.Hash, error) {
+	_ lnwallet.SatPerKWeight) (*wire.MsgTx, error) {
+
+	return nil, nil
+}
+
+func (*mockWalletController) CreateSimpleTx(outputs []*wire.TxOut,
+	_ lnwallet.SatPerKWeight, _ bool) (*txauthor.AuthoredTx, error) {
 
 	return nil, nil
 }
 
 // ListUnspentWitness is called by the wallet when doing coin selection. We just
 // need one unspent for the funding transaction.
-func (m *mockWalletController) ListUnspentWitness(confirms int32) ([]*lnwallet.Utxo, error) {
+func (m *mockWalletController) ListUnspentWitness(minconfirms,
+	maxconfirms int32) ([]*lnwallet.Utxo, error) {
 	utxo := &lnwallet.Utxo{
 		AddressType: lnwallet.WitnessPubKey,
 		Value:       btcutil.Amount(10 * btcutil.SatoshiPerBitcoin),
@@ -298,25 +315,30 @@ func (m *mockSecretKeyRing) ScalarMult(keyDesc keychain.KeyDescriptor,
 
 type mockPreimageCache struct {
 	sync.Mutex
-	preimageMap map[[32]byte][]byte
+	preimageMap map[lntypes.Hash]lntypes.Preimage
 }
 
-func (m *mockPreimageCache) LookupPreimage(hash []byte) ([]byte, bool) {
+func newMockPreimageCache() *mockPreimageCache {
+	return &mockPreimageCache{
+		preimageMap: make(map[lntypes.Hash]lntypes.Preimage),
+	}
+}
+
+func (m *mockPreimageCache) LookupPreimage(hash lntypes.Hash) (lntypes.Preimage, bool) {
 	m.Lock()
 	defer m.Unlock()
 
-	var h [32]byte
-	copy(h[:], hash)
-
-	p, ok := m.preimageMap[h]
+	p, ok := m.preimageMap[hash]
 	return p, ok
 }
 
-func (m *mockPreimageCache) AddPreimage(preimage []byte) error {
+func (m *mockPreimageCache) AddPreimages(preimages ...lntypes.Preimage) error {
 	m.Lock()
 	defer m.Unlock()
 
-	m.preimageMap[sha256.Sum256(preimage[:])] = preimage
+	for _, preimage := range preimages {
+		m.preimageMap[preimage.Hash()] = preimage
+	}
 
 	return nil
 }

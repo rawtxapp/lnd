@@ -49,7 +49,7 @@ func ChannelGraphFromDatabase(db *channeldb.ChannelGraph) ChannelGraph {
 // channeldb.LightningNode. The wrapper method implement the autopilot.Node
 // interface.
 type dbNode struct {
-	tx *bolt.Tx
+	tx *bbolt.Tx
 
 	node *channeldb.LightningNode
 }
@@ -82,13 +82,13 @@ func (d dbNode) Addrs() []net.Addr {
 //
 // NOTE: Part of the autopilot.Node interface.
 func (d dbNode) ForEachChannel(cb func(ChannelEdge) error) error {
-	return d.node.ForEachChannel(d.tx, func(tx *bolt.Tx,
+	return d.node.ForEachChannel(d.tx, func(tx *bbolt.Tx,
 		ei *channeldb.ChannelEdgeInfo, ep, _ *channeldb.ChannelEdgePolicy) error {
 
 		// Skip channels for which no outgoing edge policy is available.
 		//
 		// TODO(joostjager): Ideally the case where channels have a nil
-		// policy should be supported, as auto pilot is not looking at
+		// policy should be supported, as autopilot is not looking at
 		// the policies. For now, it is not easily possible to get a
 		// reference to the other end LightningNode object without
 		// retrieving the policy.
@@ -119,7 +119,7 @@ func (d dbNode) ForEachChannel(cb func(ChannelEdge) error) error {
 //
 // NOTE: Part of the autopilot.ChannelGraph interface.
 func (d *databaseChannelGraph) ForEachNode(cb func(Node) error) error {
-	return d.db.ForEachNode(nil, func(tx *bolt.Tx, n *channeldb.LightningNode) error {
+	return d.db.ForEachNode(nil, func(tx *bbolt.Tx, n *channeldb.LightningNode) error {
 
 		// We'll skip over any node that doesn't have any advertised
 		// addresses. As we won't be able to reach them to actually
@@ -227,9 +227,11 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		LastUpdate:                time.Now(),
 		TimeLockDelta:             10,
 		MinHTLC:                   1,
+		MaxHTLC:                   lnwire.NewMSatFromSatoshis(capacity),
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
-		Flags: 0,
+		MessageFlags:              1,
+		ChannelFlags:              0,
 	}
 
 	if err := d.db.UpdateEdgePolicy(edgePolicy); err != nil {
@@ -241,9 +243,11 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		LastUpdate:                time.Now(),
 		TimeLockDelta:             10,
 		MinHTLC:                   1,
+		MaxHTLC:                   lnwire.NewMSatFromSatoshis(capacity),
 		FeeBaseMSat:               10,
 		FeeProportionalMillionths: 10000,
-		Flags: 1,
+		MessageFlags:              1,
+		ChannelFlags:              1,
 	}
 	if err := d.db.UpdateEdgePolicy(edgePolicy); err != nil {
 		return nil, nil, err
@@ -268,6 +272,30 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 			},
 		},
 		nil
+}
+
+func (d *databaseChannelGraph) addRandNode() (*btcec.PublicKey, error) {
+	nodeKey, err := randKey()
+	if err != nil {
+		return nil, err
+	}
+	dbNode := &channeldb.LightningNode{
+		HaveNodeAnnouncement: true,
+		Addresses: []net.Addr{
+			&net.TCPAddr{
+				IP: bytes.Repeat([]byte("a"), 16),
+			},
+		},
+		Features:     lnwire.NewFeatureVector(nil, lnwire.GlobalFeatures),
+		AuthSigBytes: testSig.Serialize(),
+	}
+	dbNode.AddPubKey(nodeKey)
+	if err := d.db.AddLightningNode(dbNode); err != nil {
+		return nil, err
+	}
+
+	return nodeKey, nil
+
 }
 
 // memChannelGraph is an implementation of the autopilot.ChannelGraph backed by
@@ -335,6 +363,11 @@ func (m *memChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		if !ok {
 			vertex1 = memNode{
 				pub: node1,
+				addrs: []net.Addr{
+					&net.TCPAddr{
+						IP: bytes.Repeat([]byte("a"), 16),
+					},
+				},
 			}
 		}
 	} else {
@@ -344,6 +377,11 @@ func (m *memChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		}
 		vertex1 = memNode{
 			pub: newPub,
+			addrs: []net.Addr{
+				&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				},
+			},
 		}
 	}
 
@@ -352,6 +390,11 @@ func (m *memChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		if !ok {
 			vertex2 = memNode{
 				pub: node2,
+				addrs: []net.Addr{
+					&net.TCPAddr{
+						IP: bytes.Repeat([]byte("a"), 16),
+					},
+				},
 			}
 		}
 	} else {
@@ -361,6 +404,11 @@ func (m *memChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 		}
 		vertex2 = memNode{
 			pub: newPub,
+			addrs: []net.Addr{
+				&net.TCPAddr{
+					IP: bytes.Repeat([]byte("a"), 16),
+				},
+			},
 		}
 	}
 
@@ -385,6 +433,24 @@ func (m *memChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 	m.graph[NewNodeID(vertex2.pub)] = vertex2
 
 	return &edge1, &edge2, nil
+}
+
+func (m *memChannelGraph) addRandNode() (*btcec.PublicKey, error) {
+	newPub, err := randKey()
+	if err != nil {
+		return nil, err
+	}
+	vertex := memNode{
+		pub: newPub,
+		addrs: []net.Addr{
+			&net.TCPAddr{
+				IP: bytes.Repeat([]byte("a"), 16),
+			},
+		},
+	}
+	m.graph[NewNodeID(newPub)] = vertex
+
+	return newPub, nil
 }
 
 // memNode is a purely in-memory implementation of the autopilot.Node

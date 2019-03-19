@@ -43,6 +43,10 @@ var (
 	// specific identity can't be found.
 	ErrNodeNotFound = fmt.Errorf("link node with target identity not found")
 
+	// ErrChannelNotFound is returned when we attempt to locate a channel
+	// for a specific chain, but it is not found.
+	ErrChannelNotFound = fmt.Errorf("channel not found")
+
 	// ErrMetaNotFound is returned when meta bucket hasn't been
 	// created.
 	ErrMetaNotFound = fmt.Errorf("unable to locate meta information")
@@ -93,6 +97,17 @@ var (
 	// ErrNoForwardingEvents is returned in the case that a query fails due
 	// to the log not having any recorded events.
 	ErrNoForwardingEvents = fmt.Errorf("no recorded forwarding events")
+
+	// ErrEdgePolicyOptionalFieldNotFound is an error returned if a channel
+	// policy field is not found in the db even though its message flags
+	// indicate it should be.
+	ErrEdgePolicyOptionalFieldNotFound = fmt.Errorf("optional field not " +
+		"present")
+
+	// ErrChanAlreadyExists is return when the caller attempts to create a
+	// channel with a channel point that is already present in the
+	// database.
+	ErrChanAlreadyExists = fmt.Errorf("channel already exists")
 )
 
 // ErrTooManyExtraOpaqueBytes creates an error which should be returned if the

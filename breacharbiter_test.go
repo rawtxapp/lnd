@@ -22,12 +22,12 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/btcsuite/btclog"
 	"github.com/btcsuite/btcutil"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/htlcswitch"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
@@ -95,8 +95,8 @@ var (
 		{
 			amt:         btcutil.Amount(1e7),
 			outpoint:    breachOutPoints[0],
-			witnessType: lnwallet.CommitmentNoDelay,
-			signDesc: lnwallet.SignDescriptor{
+			witnessType: input.CommitmentNoDelay,
+			signDesc: input.SignDescriptor{
 				SingleTweak: []byte{
 					0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
 					0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
@@ -139,8 +139,8 @@ var (
 		{
 			amt:         btcutil.Amount(2e9),
 			outpoint:    breachOutPoints[1],
-			witnessType: lnwallet.CommitmentRevoke,
-			signDesc: lnwallet.SignDescriptor{
+			witnessType: input.CommitmentRevoke,
+			signDesc: input.SignDescriptor{
 				SingleTweak: []byte{
 					0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
 					0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
@@ -183,8 +183,8 @@ var (
 		{
 			amt:         btcutil.Amount(3e4),
 			outpoint:    breachOutPoints[2],
-			witnessType: lnwallet.CommitmentDelayOutput,
-			signDesc: lnwallet.SignDescriptor{
+			witnessType: input.CommitmentDelayOutput,
+			signDesc: input.SignDescriptor{
 				SingleTweak: []byte{
 					0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
 					0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
@@ -268,10 +268,6 @@ var (
 )
 
 func init() {
-	channeldb.UseLogger(btclog.Disabled)
-	lnwallet.UseLogger(btclog.Disabled)
-	brarLog = btclog.Disabled
-
 	// Ensure that breached outputs are initialized before starting tests.
 	if err := initBreachedOutputs(); err != nil {
 		panic(err)
@@ -633,36 +629,34 @@ func makeTestChannelDB() (*channeldb.DB, func(), error) {
 // channeldb.DB, and tests its behavior using the general RetributionStore test
 // suite.
 func TestChannelDBRetributionStore(t *testing.T) {
-	db, cleanUp, err := makeTestChannelDB()
-	if err != nil {
-		t.Fatalf("unable to open channeldb: %v", err)
-	}
-	defer db.Close()
-	defer cleanUp()
-
-	restartDb := func() RetributionStore {
-		// Close and reopen channeldb
-		if err = db.Close(); err != nil {
-			t.Fatalf("unable to close channeldb during restart: %v",
-				err)
-		}
-		db, err = channeldb.Open(db.Path())
-		if err != nil {
-			t.Fatalf("unable to open channeldb: %v", err)
-		}
-
-		return newRetributionStore(db)
-	}
-
 	// Finally, instantiate retribution store and execute RetributionStore
 	// test suite.
 	for _, test := range retributionStoreTestSuite {
 		t.Run(
 			"channeldbDBRetributionStore."+test.name,
 			func(tt *testing.T) {
-				if err = db.Wipe(); err != nil {
-					t.Fatalf("unable to wipe channeldb: %v",
-						err)
+				db, cleanUp, err := makeTestChannelDB()
+				if err != nil {
+					t.Fatalf("unable to open channeldb: %v", err)
+				}
+				defer db.Close()
+				defer cleanUp()
+
+				restartDb := func() RetributionStore {
+					// Close and reopen channeldb
+					if err = db.Close(); err != nil {
+						t.Fatalf("unable to close "+
+							"channeldb during "+
+							"restart: %v",
+							err)
+					}
+					db, err = channeldb.Open(db.Path())
+					if err != nil {
+						t.Fatalf("unable to open "+
+							"channeldb: %v", err)
+					}
+
+					return newRetributionStore(db)
 				}
 
 				frs := newFailingRetributionStore(restartDb)
@@ -823,7 +817,11 @@ func testRetributionStoreRemoves(
 	for i, retInfo := range retributions {
 		// Snapshot number of entries before and after the removal.
 		nbefore := countRetributions(t, frs)
-		if err := frs.Remove(&retInfo.chanPoint); err != nil {
+		err := frs.Remove(&retInfo.chanPoint)
+		switch {
+		case nbefore == 0 && err == nil:
+
+		case nbefore > 0 && err != nil:
 			t.Fatalf("unable to remove to retribution %v "+
 				"from store: %v", i, err)
 		}
@@ -1012,7 +1010,7 @@ func TestBreachHandoffSuccess(t *testing.T) {
 		ProcessACK: make(chan error, 1),
 		BreachRetribution: &lnwallet.BreachRetribution{
 			BreachTransaction: bobClose.CloseTx,
-			LocalOutputSignDesc: &lnwallet.SignDescriptor{
+			LocalOutputSignDesc: &input.SignDescriptor{
 				Output: &wire.TxOut{
 					PkScript: breachKeys[0],
 				},
@@ -1044,7 +1042,7 @@ func TestBreachHandoffSuccess(t *testing.T) {
 		ProcessACK: make(chan error, 1),
 		BreachRetribution: &lnwallet.BreachRetribution{
 			BreachTransaction: bobClose.CloseTx,
-			LocalOutputSignDesc: &lnwallet.SignDescriptor{
+			LocalOutputSignDesc: &input.SignDescriptor{
 				Output: &wire.TxOut{
 					PkScript: breachKeys[0],
 				},
@@ -1093,7 +1091,7 @@ func TestBreachHandoffFail(t *testing.T) {
 		ProcessACK: make(chan error, 1),
 		BreachRetribution: &lnwallet.BreachRetribution{
 			BreachTransaction: bobClose.CloseTx,
-			LocalOutputSignDesc: &lnwallet.SignDescriptor{
+			LocalOutputSignDesc: &input.SignDescriptor{
 				Output: &wire.TxOut{
 					PkScript: breachKeys[0],
 				},
@@ -1126,18 +1124,6 @@ func TestBreachHandoffFail(t *testing.T) {
 	}
 	defer cleanUpArb()
 
-	// Instantiate a second lightning channel for alice, using the state of
-	// her last channel.
-	aliceKeyPriv, _ := btcec.PrivKeyFromBytes(btcec.S256(),
-		alicesPrivKey)
-	aliceSigner := &mockSigner{aliceKeyPriv}
-
-	alice2, err := lnwallet.NewLightningChannel(aliceSigner, nil, alice.State())
-	if err != nil {
-		t.Fatalf("unable to create test channels: %v", err)
-	}
-	defer alice2.Stop()
-
 	// Signal a spend of the funding transaction and wait for the close
 	// observer to exit. This time we are allowing the handoff to succeed.
 	breach = &ContractBreachEvent{
@@ -1145,7 +1131,7 @@ func TestBreachHandoffFail(t *testing.T) {
 		ProcessACK: make(chan error, 1),
 		BreachRetribution: &lnwallet.BreachRetribution{
 			BreachTransaction: bobClose.CloseTx,
-			LocalOutputSignDesc: &lnwallet.SignDescriptor{
+			LocalOutputSignDesc: &input.SignDescriptor{
 				Output: &wire.TxOut{
 					PkScript: breachKeys[0],
 				},
@@ -1196,7 +1182,7 @@ func TestBreachSecondLevelTransfer(t *testing.T) {
 
 	// Notify the breach arbiter about the breach.
 	retribution, err := lnwallet.NewBreachRetribution(
-		alice.State(), height, forceCloseTx, 1)
+		alice.State(), height, 1)
 	if err != nil {
 		t.Fatalf("unable to create breach retribution: %v", err)
 	}
@@ -1351,7 +1337,7 @@ func createTestArbiter(t *testing.T, contractBreaches chan *ContractBreachEvent,
 	ba := newBreachArbiter(&BreachConfig{
 		CloseLink:          func(_ *wire.OutPoint, _ htlcswitch.ChannelCloseType) {},
 		DB:                 db,
-		Estimator:          &lnwallet.StaticFeeEstimator{FeePerKW: 12500},
+		Estimator:          lnwallet.NewStaticFeeEstimator(12500, 0),
 		GenSweepScript:     func() ([]byte, error) { return nil, nil },
 		ContractBreaches:   contractBreaches,
 		Signer:             signer,
@@ -1406,8 +1392,8 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 			ChanReserve:      0,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
+			CsvDelay:         uint16(csvTimeoutAlice),
 		},
-		CsvDelay: uint16(csvTimeoutAlice),
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: aliceKeyPub,
 		},
@@ -1431,8 +1417,8 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 			ChanReserve:      0,
 			MinHTLC:          0,
 			MaxAcceptedHtlcs: uint16(rand.Int31()),
+			CsvDelay:         uint16(csvTimeoutBob),
 		},
-		CsvDelay: uint16(csvTimeoutBob),
 		MultiSigKey: keychain.KeyDescriptor{
 			PubKey: bobKeyPub,
 		},
@@ -1459,7 +1445,7 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	bobCommitPoint := lnwallet.ComputeCommitmentPoint(bobFirstRevoke[:])
+	bobCommitPoint := input.ComputeCommitmentPoint(bobFirstRevoke[:])
 
 	aliceRoot, err := chainhash.NewHash(aliceKeyPriv.Serialize())
 	if err != nil {
@@ -1470,7 +1456,7 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	aliceCommitPoint := lnwallet.ComputeCommitmentPoint(aliceFirstRevoke[:])
+	aliceCommitPoint := input.ComputeCommitmentPoint(aliceFirstRevoke[:])
 
 	aliceCommitTx, bobCommitTx, err := lnwallet.CreateCommitmentTxns(channelBal,
 		channelBal, &aliceCfg, &bobCfg, aliceCommitPoint, bobCommitPoint,
@@ -1491,7 +1477,7 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 		return nil, nil, nil, err
 	}
 
-	estimator := &lnwallet.StaticFeeEstimator{FeePerKW: 12500}
+	estimator := lnwallet.NewStaticFeeEstimator(12500, 0)
 	feePerKw, err := estimator.EstimateFeePerKW(1)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1562,26 +1548,28 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 		Packager:                channeldb.NewChannelPackager(shortChanID),
 	}
 
-	pCache := &mockPreimageCache{
-		// hash -> preimage
-		preimageMap: make(map[[32]byte][]byte),
-	}
+	pCache := newMockPreimageCache()
 
 	aliceSigner := &mockSigner{aliceKeyPriv}
 	bobSigner := &mockSigner{bobKeyPriv}
 
+	alicePool := lnwallet.NewSigPool(1, aliceSigner)
 	channelAlice, err := lnwallet.NewLightningChannel(
-		aliceSigner, pCache, aliceChannelState,
+		aliceSigner, pCache, aliceChannelState, alicePool,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	alicePool.Start()
+
+	bobPool := lnwallet.NewSigPool(1, bobSigner)
 	channelBob, err := lnwallet.NewLightningChannel(
-		bobSigner, pCache, bobChannelState,
+		bobSigner, pCache, bobChannelState, bobPool,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	bobPool.Start()
 
 	addr := &net.TCPAddr{
 		IP:   net.ParseIP("127.0.0.1"),
@@ -1590,18 +1578,12 @@ func createInitChannels(revocationWindow int) (*lnwallet.LightningChannel, *lnwa
 	if err := channelAlice.State().SyncPending(addr, 101); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := channelAlice.State().FullSync(); err != nil {
-		return nil, nil, nil, err
-	}
 
 	addr = &net.TCPAddr{
 		IP:   net.ParseIP("127.0.0.1"),
 		Port: 18555,
 	}
 	if err := channelBob.State().SyncPending(addr, 101); err != nil {
-		return nil, nil, nil, err
-	}
-	if err := channelBob.State().FullSync(); err != nil {
 		return nil, nil, nil, err
 	}
 

@@ -128,7 +128,7 @@ macaroon = macaroon_binary.each_byte.map { |b| b.to_s(16).rjust(2,'0') }.join
 The simplest approach to use the macaroon is to include the metadata in each request as shown below.
 
 ```ruby
-stub.get_info(Lnrpc::GetInfoRequest.new, metadata: {metadata: macaroon})
+stub.get_info(Lnrpc::GetInfoRequest.new, metadata: {macaroon: macaroon})
 ```
 
 However, this can get tiresome to do for each request. We can use gRPC interceptors to add this metadata to each request automatically. Our interceptor class would look like this.
@@ -143,6 +143,11 @@ class MacaroonInterceptor < GRPC::ClientInterceptor
   end
 
   def request_response(request:, call:, method:, metadata:)
+    metadata['macaroon'] = macaroon
+    yield
+  end
+
+  def server_streamer(request:, call:, method:, metadata:)
     metadata['macaroon'] = macaroon
     yield
   end
@@ -165,4 +170,16 @@ stub = Lnrpc::Lightning::Stub.new(
 
 # Now we don't need to pass the metadata on a request level
 p stub.get_info(Lnrpc::GetInfoRequest.new)
+```
+
+#### Receive Large Responses
+
+A GRPC::ResourceExhausted exception is raised when a server response is too large. In particular, this will happen with mainnet DescribeGraph calls. The solution is to raise the default limits by including a channel_args hash when creating our stub.
+
+```ruby
+stub = Lnrpc::Lightning::Stub.new(
+  'localhost:10009',
+  credentials,
+  channel_args: {"grpc.max_receive_message_length" => 1024 * 1024 * 50}
+)
 ```

@@ -5,10 +5,10 @@ typing a few commands. All configuration between `lnd` and `btcd` are handled
 automatically by their `docker-compose` config file.
 
 ### Prerequisites
-    Name  | Version 
-    --------|---------
-    docker-compose | 1.9.0
-    docker | 1.13.0
+Name  | Version 
+--------|---------
+docker-compose | 1.9.0
+docker | 1.13.0
   
 ### Table of content
  * [Create lightning network cluster](#create-lightning-network-cluster)
@@ -101,6 +101,7 @@ bob$ lncli --network=simnet getinfo
     "alias": "",
     "num_pending_channels": 0,
     "num_active_channels": 0,
+    "num_inactive_channels": 0,
     "num_peers": 0,
     "block_height": 1215,
     "block_hash": "7d0bc86ea4151ed3b5be908ea883d2ac3073263537bcf8ca2dca4bec22e79d50",
@@ -309,7 +310,7 @@ The `Faucet` node address can be found at the [Faucet Lightning Community webpag
 $ docker-compose up -d "alice"; docker exec -i -t "alice" bash
 
 # Connect "Alice" to the "Faucet" node:
-alice$ lncli --network=simnet connect <faucet_identity_address>@<faucet_host>
+alice$ lncli --network=testnet connect <faucet_identity_address>@<faucet_host>
 ```
 
 After a connection is achieved, the `Faucet` node should create the channel
@@ -321,8 +322,7 @@ and send some amount of bitcoins to `Alice`.
 - Close channel with `Faucet` and check the onchain balance.
 
 ### Questions
-[![Irc](https://img.shields.io/badge/chat-on%20freenode-brightgreen.svg)]
-(https://webchat.freenode.net/?channels=lnd)
+[![Irc](https://img.shields.io/badge/chat-on%20freenode-brightgreen.svg)](https://webchat.freenode.net/?channels=lnd)
 
 * How to see `alice` | `bob` | `btcd` logs?
 ```bash

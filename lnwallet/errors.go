@@ -78,6 +78,13 @@ func ErrChanReserveTooLarge(reserve,
 	}
 }
 
+// ErrNonZeroPushAmount is returned by a remote peer that receives a
+// FundingOpen request for a channel with non-zero push amount while
+// they have 'rejectpush' enabled.
+func ErrNonZeroPushAmount() ReservationError {
+	return ReservationError{errors.New("Non-zero push amounts are disabled")}
+}
+
 // ErrMinHtlcTooLarge returns an error indicating that the MinHTLC value the
 // remote required is too large to be accepted.
 func ErrMinHtlcTooLarge(minHtlc,
@@ -113,6 +120,15 @@ func ErrMaxValueInFlightTooSmall(maxValInFlight,
 	return ReservationError{
 		fmt.Errorf("maxValueInFlight too small: %v, min is %v",
 			maxValInFlight, minMaxValInFlight),
+	}
+}
+
+// ErrNumConfsTooLarge returns an error indicating that the number of
+// confirmations required for a channel is too large.
+func ErrNumConfsTooLarge(numConfs, maxNumConfs uint32) error {
+	return ReservationError{
+		fmt.Errorf("minimum depth of %d is too large, max is %d",
+			numConfs, maxNumConfs),
 	}
 }
 

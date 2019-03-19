@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/lnwire"
 )
 
 // migrateNodeAndEdgeUpdateIndex is a migration function that will update the
@@ -14,7 +15,7 @@ import (
 // (one for nodes and one for edges) to keep track of the last time a node or
 // edge was updated on the network. These new indexes allow us to implement the
 // new graph sync protocol added.
-func migrateNodeAndEdgeUpdateIndex(tx *bolt.Tx) error {
+func migrateNodeAndEdgeUpdateIndex(tx *bbolt.Tx) error {
 	// First, we'll populating the node portion of the new index. Before we
 	// can add new values to the index, we'll first create the new bucket
 	// where these items will be housed.
@@ -119,7 +120,7 @@ func migrateNodeAndEdgeUpdateIndex(tx *bolt.Tx) error {
 // invoices an index in the add and/or the settle index. Additionally, all
 // existing invoices will have their bytes padded out in order to encode the
 // add+settle index as well as the amount paid.
-func migrateInvoiceTimeSeries(tx *bolt.Tx) error {
+func migrateInvoiceTimeSeries(tx *bbolt.Tx) error {
 	invoices, err := tx.CreateBucketIfNotExists(invoiceBucket)
 	if err != nil {
 		return err
@@ -189,7 +190,7 @@ func migrateInvoiceTimeSeries(tx *bolt.Tx) error {
 		// Next, we'll check if the invoice has been settled or not. If
 		// so, then we'll also add it to the settle index.
 		var nextSettleSeqNo uint64
-		if invoice.Terms.Settled {
+		if invoice.Terms.State == ContractSettled {
 			nextSettleSeqNo, err = settleIndex.NextSequence()
 			if err != nil {
 				return err
@@ -238,7 +239,7 @@ func migrateInvoiceTimeSeries(tx *bolt.Tx) error {
 // migrateInvoiceTimeSeries migration. As at the time of writing, the
 // OutgoingPayment struct embeddeds an instance of the Invoice struct. As a
 // result, we also need to migrate the internal invoice to the new format.
-func migrateInvoiceTimeSeriesOutgoingPayments(tx *bolt.Tx) error {
+func migrateInvoiceTimeSeriesOutgoingPayments(tx *bbolt.Tx) error {
 	payBucket := tx.Bucket(paymentBucket)
 	if payBucket == nil {
 		return nil
@@ -307,7 +308,7 @@ func migrateInvoiceTimeSeriesOutgoingPayments(tx *bolt.Tx) error {
 // bucket. It ensure that edges with unknown policies will also have an entry
 // in the bucket. After the migration, there will be two edge entries for
 // every channel, regardless of whether the policies are known.
-func migrateEdgePolicies(tx *bolt.Tx) error {
+func migrateEdgePolicies(tx *bbolt.Tx) error {
 	nodes := tx.Bucket(nodeBucket)
 	if nodes == nil {
 		return nil
@@ -379,7 +380,7 @@ func migrateEdgePolicies(tx *bolt.Tx) error {
 // paymentStatusesMigration is a database migration intended for adding payment
 // statuses for each existing payment entity in bucket to be able control
 // transitions of statuses and prevent cases such as double payment
-func paymentStatusesMigration(tx *bolt.Tx) error {
+func paymentStatusesMigration(tx *bbolt.Tx) error {
 	// Get the bucket dedicated to storing statuses of payments,
 	// where a key is payment hash, value is payment status.
 	paymentStatuses, err := tx.CreateBucketIfNotExists(paymentStatusBucket)
@@ -466,7 +467,7 @@ func paymentStatusesMigration(tx *bolt.Tx) error {
 // migration also fixes the case where the public keys within edge policies were
 // being serialized with an extra byte, causing an even greater error when
 // attempting to perform the offset calculation described earlier.
-func migratePruneEdgeUpdateIndex(tx *bolt.Tx) error {
+func migratePruneEdgeUpdateIndex(tx *bbolt.Tx) error {
 	// To begin the migration, we'll retrieve the update index bucket. If it
 	// does not exist, we have nothing left to do so we can simply exit.
 	edges := tx.Bucket(edgeBucket)
@@ -563,13 +564,122 @@ func migratePruneEdgeUpdateIndex(tx *bolt.Tx) error {
 			return err
 		}
 
-		err = updateEdgePolicy(edges, edgeIndex, nodes, edgePolicy)
+		err = updateEdgePolicy(tx, edgePolicy)
 		if err != nil {
 			return err
 		}
 	}
 
 	log.Info("Migration to properly prune edge update index complete!")
+
+	return nil
+}
+
+// migrateOptionalChannelCloseSummaryFields migrates the serialized format of
+// ChannelCloseSummary to a format where optional fields' presence is indicated
+// with boolean markers.
+func migrateOptionalChannelCloseSummaryFields(tx *bbolt.Tx) error {
+	closedChanBucket := tx.Bucket(closedChannelBucket)
+	if closedChanBucket == nil {
+		return nil
+	}
+
+	log.Info("Migrating to new closed channel format...")
+	err := closedChanBucket.ForEach(func(chanID, summary []byte) error {
+		r := bytes.NewReader(summary)
+
+		// Read the old (v6) format from the database.
+		c, err := deserializeCloseChannelSummaryV6(r)
+		if err != nil {
+			return err
+		}
+
+		// Serialize using the new format, and put back into the
+		// bucket.
+		var b bytes.Buffer
+		if err := serializeChannelCloseSummary(&b, c); err != nil {
+			return err
+		}
+
+		return closedChanBucket.Put(chanID, b.Bytes())
+	})
+	if err != nil {
+		return fmt.Errorf("unable to update closed channels: %v", err)
+	}
+
+	log.Info("Migration to new closed channel format complete!")
+
+	return nil
+}
+
+var messageStoreBucket = []byte("message-store")
+
+// migrateGossipMessageStoreKeys migrates the key format for gossip messages
+// found in the message store to a new one that takes into consideration the of
+// the message being stored.
+func migrateGossipMessageStoreKeys(tx *bbolt.Tx) error {
+	// We'll start by retrieving the bucket in which these messages are
+	// stored within. If there isn't one, there's nothing left for us to do
+	// so we can avoid the migration.
+	messageStore := tx.Bucket(messageStoreBucket)
+	if messageStore == nil {
+		return nil
+	}
+
+	log.Info("Migrating to the gossip message store new key format")
+
+	// Otherwise we'll proceed with the migration. We'll start by coalescing
+	// all the current messages within the store, which are indexed by the
+	// public key of the peer which they should be sent to, followed by the
+	// short channel ID of the channel for which the message belongs to. We
+	// should only expect to find channel announcement signatures as that
+	// was the only support message type previously.
+	msgs := make(map[[33 + 8]byte]*lnwire.AnnounceSignatures)
+	err := messageStore.ForEach(func(k, v []byte) error {
+		var msgKey [33 + 8]byte
+		copy(msgKey[:], k)
+
+		msg := &lnwire.AnnounceSignatures{}
+		if err := msg.Decode(bytes.NewReader(v), 0); err != nil {
+			return err
+		}
+
+		msgs[msgKey] = msg
+
+		return nil
+
+	})
+	if err != nil {
+		return err
+	}
+
+	// Then, we'll go over all of our messages, remove their previous entry,
+	// and add another with the new key format. Once we've done this for
+	// every message, we can consider the migration complete.
+	for oldMsgKey, msg := range msgs {
+		if err := messageStore.Delete(oldMsgKey[:]); err != nil {
+			return err
+		}
+
+		// Construct the new key for which we'll find this message with
+		// in the store. It'll be the same as the old, but we'll also
+		// include the message type.
+		var msgType [2]byte
+		binary.BigEndian.PutUint16(msgType[:], uint16(msg.MsgType()))
+		newMsgKey := append(oldMsgKey[:], msgType[:]...)
+
+		// Serialize the message with its wire encoding.
+		var b bytes.Buffer
+		if _, err := lnwire.WriteMessage(&b, msg, 0); err != nil {
+			return err
+		}
+
+		if err := messageStore.Put(newMsgKey, b.Bytes()); err != nil {
+			return err
+		}
+	}
+
+	log.Info("Migration to the gossip message store new key format complete!")
 
 	return nil
 }
