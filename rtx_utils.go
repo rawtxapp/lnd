@@ -30,8 +30,3 @@ func GetEnv(v *C.char) *C.char {
 func SetEnv(key *C.char, val *C.char) {
 	os.Setenv(C.GoString(key), C.GoString(val))
 }
-
-//export GetLndVersion
-func GetLndVersion() *C.char {
-	return C.CString(version())
-}
