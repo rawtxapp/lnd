@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -303,22 +304,26 @@ type testChannelPolicy struct {
 	MaxHTLC     lnwire.MilliSatoshi
 	FeeBaseMsat lnwire.MilliSatoshi
 	FeeRate     lnwire.MilliSatoshi
+	LastUpdate  time.Time
+	Disabled    bool
 }
 
 type testChannelEnd struct {
 	Alias string
-	testChannelPolicy
+	*testChannelPolicy
 }
 
 func defaultTestChannelEnd(alias string, capacity btcutil.Amount) *testChannelEnd {
 	return &testChannelEnd{
 		Alias: alias,
-		testChannelPolicy: testChannelPolicy{
+		testChannelPolicy: &testChannelPolicy{
 			Expiry:      144,
 			MinHTLC:     lnwire.MilliSatoshi(1000),
 			MaxHTLC:     lnwire.NewMSatFromSatoshis(capacity),
 			FeeBaseMsat: lnwire.MilliSatoshi(1000),
 			FeeRate:     lnwire.MilliSatoshi(1),
+			LastUpdate:  testTime,
+			Disabled:    false,
 		},
 	}
 }
@@ -337,11 +342,11 @@ func symmetricTestChannel(alias1 string, alias2 string, capacity btcutil.Amount,
 		Capacity: capacity,
 		Node1: &testChannelEnd{
 			Alias:             alias1,
-			testChannelPolicy: *policy,
+			testChannelPolicy: policy,
 		},
 		Node2: &testChannelEnd{
 			Alias:             alias2,
-			testChannelPolicy: *policy,
+			testChannelPolicy: policy,
 		},
 		ChannelID: id,
 	}
@@ -490,45 +495,56 @@ func createTestGraphFromChannels(testChannels []*testChannel) (*testGraphInstanc
 			return nil, err
 		}
 
-		var msgFlags lnwire.ChanUpdateMsgFlags
-		if testChannel.Node1.MaxHTLC != 0 {
-			msgFlags = 1
-		}
-		edgePolicy := &channeldb.ChannelEdgePolicy{
-			SigBytes:                  testSig.Serialize(),
-			MessageFlags:              msgFlags,
-			ChannelFlags:              0,
-			ChannelID:                 channelID,
-			LastUpdate:                testTime,
-			TimeLockDelta:             testChannel.Node1.Expiry,
-			MinHTLC:                   testChannel.Node1.MinHTLC,
-			MaxHTLC:                   testChannel.Node1.MaxHTLC,
-			FeeBaseMSat:               testChannel.Node1.FeeBaseMsat,
-			FeeProportionalMillionths: testChannel.Node1.FeeRate,
-		}
-		if err := graph.UpdateEdgePolicy(edgePolicy); err != nil {
-			return nil, err
-		}
-
-		msgFlags = 0
-		if testChannel.Node2.MaxHTLC != 0 {
-			msgFlags = 1
-		}
-		edgePolicy = &channeldb.ChannelEdgePolicy{
-			SigBytes:                  testSig.Serialize(),
-			MessageFlags:              msgFlags,
-			ChannelFlags:              lnwire.ChanUpdateDirection,
-			ChannelID:                 channelID,
-			LastUpdate:                testTime,
-			TimeLockDelta:             testChannel.Node2.Expiry,
-			MinHTLC:                   testChannel.Node2.MinHTLC,
-			MaxHTLC:                   testChannel.Node2.MaxHTLC,
-			FeeBaseMSat:               testChannel.Node2.FeeBaseMsat,
-			FeeProportionalMillionths: testChannel.Node2.FeeRate,
+		if testChannel.Node1.testChannelPolicy != nil {
+			var msgFlags lnwire.ChanUpdateMsgFlags
+			if testChannel.Node1.MaxHTLC != 0 {
+				msgFlags |= lnwire.ChanUpdateOptionMaxHtlc
+			}
+			var channelFlags lnwire.ChanUpdateChanFlags
+			if testChannel.Node1.Disabled {
+				channelFlags |= lnwire.ChanUpdateDisabled
+			}
+			edgePolicy := &channeldb.ChannelEdgePolicy{
+				SigBytes:                  testSig.Serialize(),
+				MessageFlags:              msgFlags,
+				ChannelFlags:              channelFlags,
+				ChannelID:                 channelID,
+				LastUpdate:                testChannel.Node1.LastUpdate,
+				TimeLockDelta:             testChannel.Node1.Expiry,
+				MinHTLC:                   testChannel.Node1.MinHTLC,
+				MaxHTLC:                   testChannel.Node1.MaxHTLC,
+				FeeBaseMSat:               testChannel.Node1.FeeBaseMsat,
+				FeeProportionalMillionths: testChannel.Node1.FeeRate,
+			}
+			if err := graph.UpdateEdgePolicy(edgePolicy); err != nil {
+				return nil, err
+			}
 		}
 
-		if err := graph.UpdateEdgePolicy(edgePolicy); err != nil {
-			return nil, err
+		if testChannel.Node2.testChannelPolicy != nil {
+			var msgFlags lnwire.ChanUpdateMsgFlags
+			if testChannel.Node2.MaxHTLC != 0 {
+				msgFlags |= lnwire.ChanUpdateOptionMaxHtlc
+			}
+			channelFlags := lnwire.ChanUpdateDirection
+			if testChannel.Node2.Disabled {
+				channelFlags |= lnwire.ChanUpdateDisabled
+			}
+			edgePolicy := &channeldb.ChannelEdgePolicy{
+				SigBytes:                  testSig.Serialize(),
+				MessageFlags:              msgFlags,
+				ChannelFlags:              channelFlags,
+				ChannelID:                 channelID,
+				LastUpdate:                testChannel.Node2.LastUpdate,
+				TimeLockDelta:             testChannel.Node2.Expiry,
+				MinHTLC:                   testChannel.Node2.MinHTLC,
+				MaxHTLC:                   testChannel.Node2.MaxHTLC,
+				FeeBaseMSat:               testChannel.Node2.FeeBaseMsat,
+				FeeProportionalMillionths: testChannel.Node2.FeeRate,
+			}
+			if err := graph.UpdateEdgePolicy(edgePolicy); err != nil {
+				return nil, err
+			}
 		}
 
 		channelID++
@@ -1778,7 +1794,6 @@ func TestPathFindSpecExample(t *testing.T) {
 	}
 
 	// We'll now request a route from A -> B -> C.
-	ctx.router.routeCache = make(map[routeTuple][]*Route)
 	routes, err = ctx.router.FindRoutes(
 		source.PubKeyBytes, carol, amt, noRestrictions, 100,
 	)
@@ -2019,5 +2034,113 @@ func TestRestrictOutgoingChannel(t *testing.T) {
 	if route.Hops[0].ChannelID != 2 {
 		t.Fatalf("expected route to pass through channel 2, "+
 			"but channel %v was selected instead", route.Hops[0].ChannelID)
+	}
+}
+
+// TestCltvLimit asserts that a cltv limit is obeyed by the path finding
+// algorithm.
+func TestCltvLimit(t *testing.T) {
+	t.Run("no limit", func(t *testing.T) { testCltvLimit(t, 0, 1) })
+	t.Run("no path", func(t *testing.T) { testCltvLimit(t, 50, 0) })
+	t.Run("force high cost", func(t *testing.T) { testCltvLimit(t, 80, 3) })
+}
+
+func testCltvLimit(t *testing.T, limit uint32, expectedChannel uint64) {
+	t.Parallel()
+
+	// Set up a test graph with three possible paths to the target. The path
+	// through a is the lowest cost with a high time lock (144). The path
+	// through b has a higher cost but a lower time lock (100). That path
+	// through c and d (two hops) has the same case as the path through b,
+	// but the total time lock is lower (60).
+	testChannels := []*testChannel{
+		symmetricTestChannel("roasbeef", "a", 100000, &testChannelPolicy{}, 1),
+		symmetricTestChannel("a", "target", 100000, &testChannelPolicy{
+			Expiry:      144,
+			FeeBaseMsat: 10000,
+			MinHTLC:     1,
+		}),
+		symmetricTestChannel("roasbeef", "b", 100000, &testChannelPolicy{}, 2),
+		symmetricTestChannel("b", "target", 100000, &testChannelPolicy{
+			Expiry:      100,
+			FeeBaseMsat: 20000,
+			MinHTLC:     1,
+		}),
+		symmetricTestChannel("roasbeef", "c", 100000, &testChannelPolicy{}, 3),
+		symmetricTestChannel("c", "d", 100000, &testChannelPolicy{
+			Expiry:      30,
+			FeeBaseMsat: 10000,
+			MinHTLC:     1,
+		}),
+		symmetricTestChannel("d", "target", 100000, &testChannelPolicy{
+			Expiry:      30,
+			FeeBaseMsat: 10000,
+			MinHTLC:     1,
+		}),
+	}
+
+	testGraphInstance, err := createTestGraphFromChannels(testChannels)
+	if err != nil {
+		t.Fatalf("unable to create graph: %v", err)
+	}
+	defer testGraphInstance.cleanUp()
+
+	sourceNode, err := testGraphInstance.graph.SourceNode()
+	if err != nil {
+		t.Fatalf("unable to fetch source node: %v", err)
+	}
+	sourceVertex := Vertex(sourceNode.PubKeyBytes)
+
+	ignoredEdges := make(map[EdgeLocator]struct{})
+	ignoredVertexes := make(map[Vertex]struct{})
+
+	paymentAmt := lnwire.NewMSatFromSatoshis(100)
+	target := testGraphInstance.aliasMap["target"]
+
+	// Find the best path given the cltv limit.
+	var cltvLimit *uint32
+	if limit != 0 {
+		cltvLimit = &limit
+	}
+
+	path, err := findPath(
+		&graphParams{
+			graph: testGraphInstance.graph,
+		},
+		&RestrictParams{
+			IgnoredNodes: ignoredVertexes,
+			IgnoredEdges: ignoredEdges,
+			FeeLimit:     noFeeLimit,
+			CltvLimit:    cltvLimit,
+		},
+		sourceVertex, target, paymentAmt,
+	)
+	if expectedChannel == 0 {
+		// Finish test if we expect no route.
+		if IsError(err, ErrNoPathFound) {
+			return
+		}
+		t.Fatal("expected no path to be found")
+	}
+	if err != nil {
+		t.Fatalf("unable to find path: %v", err)
+	}
+
+	const (
+		startingHeight = 100
+		finalHopCLTV   = 1
+	)
+	route, err := newRoute(
+		paymentAmt, sourceVertex, path, startingHeight, finalHopCLTV,
+	)
+	if err != nil {
+		t.Fatalf("unable to create path: %v", err)
+	}
+
+	// Assert that the route starts with the expected channel.
+	if route.Hops[0].ChannelID != expectedChannel {
+		t.Fatalf("expected route to pass through channel %v, "+
+			"but channel %v was selected instead", expectedChannel,
+			route.Hops[0].ChannelID)
 	}
 }

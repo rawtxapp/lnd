@@ -30,16 +30,6 @@ func init() {
 }
 
 const (
-	// expiryGraceDelta is a grace period that the timeout of incoming
-	// HTLC's that pay directly to us (i.e we're the "exit node") must up
-	// hold. We'll reject any HTLC's who's timeout minus this value is less
-	// that or equal to the current block height. We require this in order
-	// to ensure that if the extending party goes to the chain, then we'll
-	// be able to claim the HTLC still.
-	//
-	// TODO(roasbeef): must be < default delta
-	expiryGraceDelta = 2
-
 	// maxCltvExpiry is the maximum outgoing time lock that the node accepts
 	// for forwarded payments. The value is relative to the current block
 	// height. The reason to have a maximum is to prevent funds getting
@@ -244,6 +234,19 @@ type ChannelLinkConfig struct {
 	// fee rate. A random timeout will be selected between these values.
 	MinFeeUpdateTimeout time.Duration
 	MaxFeeUpdateTimeout time.Duration
+
+	// FinalCltvRejectDelta defines the number of blocks before the expiry
+	// of the htlc where we no longer settle it as an exit hop and instead
+	// cancel it back. Normally this value should be lower than the cltv
+	// expiry of any invoice we create and the code effectuating this should
+	// not be hit.
+	FinalCltvRejectDelta uint32
+
+	// OutgoingCltvRejectDelta defines the number of blocks before expiry of
+	// an htlc where we don't offer an htlc anymore. This should be at least
+	// the outgoing broadcast delta, because in any case we don't want to
+	// risk offering an htlc that triggers channel closure.
+	OutgoingCltvRejectDelta uint32
 }
 
 // channelLink is the service which drives a channel's commitment update
@@ -562,12 +565,32 @@ func (l *channelLink) syncChanStates() error {
 	// First, we'll generate our ChanSync message to send to the other
 	// side. Based on this message, the remote party will decide if they
 	// need to retransmit any data or not.
-	localChanSyncMsg, err := lnwallet.ChanSyncMsg(l.channel.State())
+	chanState := l.channel.State()
+	localChanSyncMsg, err := lnwallet.ChanSyncMsg(
+		chanState,
+		chanState.HasChanStatus(channeldb.ChanStatusRestored),
+	)
 	if err != nil {
 		return fmt.Errorf("unable to generate chan sync message for "+
 			"ChannelPoint(%v)", l.channel.ChannelPoint())
 	}
-	if err := l.cfg.Peer.SendMessage(false, localChanSyncMsg); err != nil {
+
+	// If we have a restored channel, we'll delay sending our channel
+	// reestablish message briefly to ensure we first have a stable
+	// connection. Sending the message will cause the remote peer to force
+	// close the channel, which currently may not be resumed reliably if the
+	// connection is being torn down simultaneously. This delay can be
+	// removed after the force close is reliable, but in the meantime it
+	// improves the reliability of successfully closing out the channel.
+	if chanState.HasChanStatus(channeldb.ChanStatusRestored) {
+		select {
+		case <-time.After(5 * time.Second):
+		case <-l.quit:
+			return ErrLinkShuttingDown
+		}
+	}
+
+	if err := l.cfg.Peer.SendMessage(true, localChanSyncMsg); err != nil {
 		return fmt.Errorf("Unable to send chan sync message for "+
 			"ChannelPoint(%v)", l.channel.ChannelPoint())
 	}
@@ -938,6 +961,13 @@ out:
 			break out
 		}
 
+		// If the previous event resulted in a non-empty
+		// batch, reinstate the batch ticker so that it can be
+		// cleared.
+		if l.batchCounter > 0 {
+			l.cfg.BatchTicker.Resume()
+		}
+
 		select {
 		// Our update fee timer has fired, so we'll check the network
 		// fee to see if we should adjust our commitment fee.
@@ -1040,13 +1070,6 @@ out:
 
 			l.handleDownStreamPkt(packet, true)
 
-			// If the downstream packet resulted in a non-empty
-			// batch, reinstate the batch ticker so that it can be
-			// cleared.
-			if l.batchCounter > 0 {
-				l.cfg.BatchTicker.Resume()
-			}
-
 		// A message from the switch was just received. This indicates
 		// that the link is an intermediate hop in a multi-hop HTLC
 		// circuit.
@@ -1068,13 +1091,6 @@ out:
 			}
 
 			l.handleDownStreamPkt(pkt, false)
-
-			// If the downstream packet resulted in a non-empty
-			// batch, reinstate the batch ticker so that it can be
-			// cleared.
-			if l.batchCounter > 0 {
-				l.cfg.BatchTicker.Resume()
-			}
 
 		// A message from the connected peer was just received. This
 		// indicates that we have a new incoming HTLC, either directly
@@ -1190,6 +1206,8 @@ func (l *channelLink) processHodlEvent(hodlEvent invoices.HodlEvent,
 		if err := hodlAction(htlc); err != nil {
 			return err
 		}
+
+		l.batchCounter++
 	}
 
 	return nil
@@ -2147,14 +2165,13 @@ func (l *channelLink) HtlcSatifiesPolicy(payHash [32]byte,
 		return failure
 	}
 
-	// We want to avoid accepting an HTLC which will expire in the near
-	// future, so we'll reject an HTLC if its expiration time is too close
-	// to the current height.
-	timeDelta := policy.TimeLockDelta
-	if incomingTimeout-timeDelta <= heightNow {
+	// We want to avoid offering an HTLC which will expire in the near
+	// future, so we'll reject an HTLC if the outgoing expiration time is
+	// too close to the current height.
+	if outgoingTimeout <= heightNow+l.cfg.OutgoingCltvRejectDelta {
 		l.errorf("htlc(%x) has an expiry that's too soon: "+
 			"outgoing_expiry=%v, best_height=%v", payHash[:],
-			incomingTimeout-timeDelta, heightNow)
+			outgoingTimeout, heightNow)
 
 		var failure lnwire.FailureMessage
 		update, err := l.cfg.FetchLastChannelUpdate(
@@ -2169,7 +2186,8 @@ func (l *channelLink) HtlcSatifiesPolicy(payHash [32]byte,
 		return failure
 	}
 
-	if outgoingTimeout-heightNow > maxCltvExpiry {
+	// Check absolute max delta.
+	if outgoingTimeout > maxCltvExpiry+heightNow {
 		l.errorf("outgoing htlc(%x) has a time lock too far in the "+
 			"future: got %v, but maximum is %v", payHash[:],
 			outgoingTimeout-heightNow, maxCltvExpiry)
@@ -2181,7 +2199,8 @@ func (l *channelLink) HtlcSatifiesPolicy(payHash [32]byte,
 	// the following constraint: the incoming time-lock minus our time-lock
 	// delta should equal the outgoing time lock. Otherwise, whether the
 	// sender messed up, or an intermediate node tampered with the HTLC.
-	if incomingTimeout-timeDelta < outgoingTimeout {
+	timeDelta := policy.TimeLockDelta
+	if incomingTimeout < outgoingTimeout+timeDelta {
 		l.errorf("Incoming htlc(%x) has incorrect time-lock value: "+
 			"expected at least %v block delta, got %v block delta",
 			payHash[:], timeDelta, incomingTimeout-outgoingTimeout)
@@ -2673,7 +2692,7 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 
 	// First, we'll check the expiry of the HTLC itself against, the current
 	// block height. If the timeout is too soon, then we'll reject the HTLC.
-	if pd.Timeout-expiryGraceDelta <= heightNow {
+	if pd.Timeout <= heightNow+l.cfg.FinalCltvRejectDelta {
 		log.Errorf("htlc(%x) has an expiry that's too soon: expiry=%v"+
 			", best_height=%v", pd.RHash[:], pd.Timeout, heightNow)
 
@@ -2767,10 +2786,15 @@ func (l *channelLink) processExitHop(pd *lnwallet.PaymentDescriptor,
 	}
 
 	// We'll also ensure that our time-lock value has been computed
-	// correctly.
+	// correctly. Only check the final cltv expiry for invoices when the
+	// invoice has not yet moved to the accepted state. Otherwise hodl htlcs
+	// would be canceled after a restart.
 	expectedHeight := heightNow + minCltvDelta
 	switch {
-	case !l.cfg.DebugHTLC && pd.Timeout < expectedHeight:
+	case !l.cfg.DebugHTLC &&
+		invoice.Terms.State == channeldb.ContractOpen &&
+		pd.Timeout < expectedHeight:
+
 		log.Errorf("Incoming htlc(%x) has an expiration that is too "+
 			"soon: expected at least %v, got %v",
 			pd.RHash[:], expectedHeight, pd.Timeout)
